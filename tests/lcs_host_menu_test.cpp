@@ -1,8 +1,11 @@
 #include "lcs_display_menu.hpp"
 #include "lcs_key_bindings.hpp"
 #include "lcs_render_config.hpp"
+#include "lcs_save_picker.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <random>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -263,6 +266,152 @@ int f10_key() {
     return 0;
 }
 
+int find_row(const lcs::HostSettingsView &view, const char *label) {
+    for (int row = 0; row < view.row_count; ++row)
+        if (std::string(view.rows[row]).find(label) != std::string::npos) return row;
+    return -1;
+}
+
+// The panel writes its changes back to the ini, and they are there on the
+// next start.
+int persist() {
+    using namespace lcs;
+    const auto path = std::filesystem::temp_directory_path() / "lcs-persist-test.ini";
+    {
+        std::ofstream out(path);
+        out << "; comment kept\n[Display]\nShowFPS=false\n[Timing]\nFrameRate=30\n";
+    }
+#if defined(_WIN32)
+    _putenv_s("PSPRECOMP_CONFIG", path.string().c_str());
+#else
+    setenv("PSPRECOMP_CONFIG", path.string().c_str(), 1);
+#endif
+    initialize_lcs_render_configuration(std::filesystem::temp_directory_path());
+    if (lcs_render_configuration().display.show_fps) return fail("fps started on");
+    if (!host_settings_handle(HostSettingsKey::Toggle)) return fail("open");
+    const int row = find_row(host_settings_view(), "FPS counter");
+    if (row < 0) return fail("fps row");
+    while (host_settings_view().selected != row) host_settings_handle(HostSettingsKey::Down);
+    if (!host_settings_handle(HostSettingsKey::Confirm)) return fail("confirm");
+    if (!lcs_render_configuration().display.show_fps) return fail("confirm did not change the row");
+    host_settings_handle(HostSettingsKey::Close);
+    std::ifstream input(path);
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (text.find("ShowFPS=true") == std::string::npos) return fail("ShowFPS not written");
+    if (text.find("; comment kept") == std::string::npos) return fail("comment lost");
+    initialize_lcs_render_configuration(std::filesystem::temp_directory_path());
+    if (!lcs_render_configuration().display.show_fps) return fail("fps not on after a restart");
+    std::filesystem::remove(path);
+#if defined(_WIN32)
+    _putenv_s("PSPRECOMP_CONFIG", "");
+#else
+    unsetenv("PSPRECOMP_CONFIG");
+#endif
+    std::cout << "written=1 reloaded=1\n";
+    return 0;
+}
+
+int triggers() {
+    using namespace lcs;
+    ControlBindings bindings = default_control_bindings();
+    const auto zr = [](PadButton button) { return button == PadButton::RightTrigger; };
+    const auto zl = [](PadButton button) { return button == PadButton::LeftTrigger; };
+    apply_switch_trigger_mode(bindings, SwitchTriggerMode::Dpad);
+    if ((sample_pad(bindings, false, zr).buttons & kPspRight) == 0) return fail("zr weapon");
+    if ((sample_pad(bindings, true, zl).buttons & kPspLeft) == 0) return fail("zl radio in a vehicle");
+    if (sample_pad(bindings, true, zr).accelerate) return fail("zr accelerates in d-pad mode");
+    apply_switch_trigger_mode(bindings, SwitchTriggerMode::Drive);
+    if (!sample_pad(bindings, true, zr).accelerate || (sample_pad(bindings, true, zr).buttons & kPspRTrigger) != 0)
+        return fail("drive zr");
+    apply_switch_trigger_mode(bindings, SwitchTriggerMode::Shoulders);
+    if ((sample_pad(bindings, false, zl).buttons & kPspLTrigger) == 0) return fail("shoulder zl");
+    std::cout << "dpad=1 drive=1 shoulders=1\n";
+    return 0;
+}
+
+void write_bytes(const std::filesystem::path &path, const std::vector<std::uint8_t> &bytes) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+int saves() {
+    using namespace lcs;
+    const auto root = std::filesystem::temp_directory_path() / "lcs-save-picker-test";
+    std::filesystem::remove_all(root);
+    const std::vector<std::uint8_t> plain(73752u, 0u);
+    std::vector<std::uint8_t> noise(73752u);
+    std::mt19937 random(7u);
+    for (std::uint8_t &byte : noise) byte = static_cast<std::uint8_t>(random());
+    SaveSfo sfo;
+    sfo.title = "GTA: Liberty City Stories";
+    sfo.savedata_title = "Liberty City Stories";
+    sfo.detail = "The Sicilian Gambit\n34%";
+    sfo.directory = "ULUS10041S0";
+    const auto sfo_bytes = build_save_sfo(sfo);
+    const auto parsed = parse_save_sfo(sfo_bytes);
+    if (!parsed || parsed->detail != sfo.detail || parsed->title != sfo.title ||
+        !parsed->crypt_mode || *parsed->crypt_mode != 0u)
+        return fail("sfo round trip");
+    write_bytes(root / "ULUS10041S0" / "DATA.BIN", plain);
+    write_bytes(root / "ULUS10041S0" / "PARAM.SFO", sfo_bytes);
+    write_bytes(root / "ULUS10041S2" / "DATA.BIN", plain);
+    write_bytes(root / "ULES00151S1" / "DATA.BIN", plain);
+    write_bytes(root / "ULES00151S3" / "DATA.BIN", noise);
+    write_bytes(root / "ULUS10160S0" / "DATA.BIN", plain);  // another game: left out
+    const std::vector<std::string> names{"S0", "S1", "S2", "S3"};
+
+    const auto load = scan_save_slots(root, "ULUS10041", names, SavePickerMode::Load);
+    if (load.size() != 4u) return fail("load list size");
+    if (load[0].slot != "S0" || load[1].slot != "S2" || load[0].foreign || !load[2].foreign ||
+        load[2].game_id != "ULES00151" || !load[3].encrypted || load[2].encrypted)
+        return fail("load list order");
+    if (load[0].detail != "The Sicilian Gambit") return fail("detail line");
+
+    save_picker_begin(SavePickerMode::Load, load, 0);
+    if (!save_picker_active() || !host_settings_open()) return fail("list not up");
+    const HostSettingsView view = host_settings_view();
+    if (!view.centered || view.row_count != 4 || std::string(view.rows[0]).find("SLOT 1") == std::string::npos)
+        return fail("list view");
+    SaveSlot chosen;
+    if (save_picker_take(chosen) != SavePickerOutcome::Pending) return fail("answered early");
+    host_settings_handle(HostSettingsKey::Down);
+    host_settings_handle(HostSettingsKey::Confirm);
+    if (save_picker_take(chosen) != SavePickerOutcome::Chosen || chosen.slot != "S2") return fail("pick S2");
+    if (host_settings_open()) return fail("list stayed up");
+
+    save_picker_begin(SavePickerMode::Load, load, 2);
+    host_settings_handle(HostSettingsKey::Confirm);  // another release: asks first
+    if (save_picker_take(chosen) != SavePickerOutcome::Pending) return fail("foreign without asking");
+    host_settings_handle(HostSettingsKey::Confirm);
+    if (save_picker_take(chosen) != SavePickerOutcome::Chosen || chosen.game_id != "ULES00151")
+        return fail("foreign pick");
+
+    save_picker_begin(SavePickerMode::Load, load, 3);
+    host_settings_handle(HostSettingsKey::Confirm);  // encrypted: a message
+    host_settings_handle(HostSettingsKey::Confirm);  // back to the list
+    host_settings_handle(HostSettingsKey::Close);
+    if (save_picker_take(chosen) != SavePickerOutcome::Cancelled) return fail("cancel");
+
+    const auto save = scan_save_slots(root, "ULUS10041", names, SavePickerMode::Save);
+    if (save.size() != 4u || !save[0].exists || save[1].exists || save[1].foreign)
+        return fail("save list");
+    if (save_focus_index(save, kSaveFocusFirstEmpty) != 1) return fail("first empty");
+    save_picker_begin(SavePickerMode::Save, save, 0);
+    host_settings_handle(HostSettingsKey::Confirm);  // overwrite?
+    host_settings_handle(HostSettingsKey::Close);    // no
+    host_settings_handle(HostSettingsKey::Down);
+    host_settings_handle(HostSettingsKey::Confirm);  // empty slot: no question
+    if (save_picker_take(chosen) != SavePickerOutcome::Chosen || chosen.slot != "S1") return fail("save pick");
+
+    save_picker_begin(SavePickerMode::Load, {}, 0);
+    host_settings_handle(HostSettingsKey::Confirm);
+    if (save_picker_take(chosen) != SavePickerOutcome::Cancelled) return fail("empty list");
+    std::filesystem::remove_all(root);
+    std::cout << "sfo=1 load=4 foreign=1 encrypted=1 save=4\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -273,5 +422,8 @@ int main(int argc, char **argv) {
     if (mode == "f10") return f10_key();
     if (mode == "bindings") return bindings();
     if (mode == "fps") return fps_counter();
+    if (mode == "persist") return persist();
+    if (mode == "triggers") return triggers();
+    if (mode == "saves") return saves();
     return 2;
 }

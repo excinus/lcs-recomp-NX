@@ -9,11 +9,12 @@
 //  2. It reads lcs_env.txt (KEY=VALUE lines) into the environment: the Switch
 //     has no environment variables, and the runtime is tuned through them.
 //  3. It checks that game/EBOOT.ELF is there, and if not shows what to do.
-//  4. It asks sys-clk (if installed) for a faster CPU and memory while the game
-//     is in focus, and gives the clocks back when it is not or when it exits.
-//  5. It runs the PC main() on a thread with a 64 MiB stack pinned to core 0.
+//  4. It runs the PC main() on a thread with a 64 MiB stack pinned to core 0.
 //
 // --wrap=pthread_create puts every other thread on cores 1 and 2.
+//
+// Clocks are the player's business (sys-clk, Ultrahand): the game leaves them
+// alone.
 
 #if defined(__SWITCH__)
 
@@ -242,90 +243,6 @@ bool env_enabled(const char *name, bool fallback) {
     if (value == nullptr || *value == '\0') return fallback;
     return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
            std::strcmp(value, "off") != 0;
-}
-
-// ---------------------------------------------------------------------------
-// Clocks. sys-clk (the usual overclocking sysmodule, part of most CFW packs)
-// accepts temporary overrides over its "sys:clk" service: command 8, input
-// {u32 module, u32 hz}; module 0 CPU, 1 GPU, 2 memory; 0 Hz hands control back
-// to sys-clk's own profile. Nothing is written to its configuration, and the
-// overrides are released whenever the game loses focus and at exit.
-
-constexpr u32 kSysClkCmdSetOverride = 8;
-constexpr u32 kSysClkModuleCpu = 0;
-constexpr u32 kSysClkModuleMem = 2;
-
-std::mutex g_clock_mutex;
-Service g_sysclk{};
-bool g_sysclk_open{};
-bool g_clocks_applied{};
-std::atomic<bool> g_clocks_wanted{false};  // Settings > Overclock (LCSNative.ini [Switch] Overclock)
-bool g_clocks_forbidden{};                 // lcs_env.txt LCS_NX_OVERCLOCK=0
-u32 g_cpu_hz{1785000000u};
-u32 g_mem_hz{1600000000u};
-AppletHookCookie g_focus_cookie{};
-
-bool in_focus() { return appletGetFocusState() == AppletFocusState_InFocus; }
-
-void sysclk_set(u32 module, u32 hz) {
-    const struct {
-        u32 module;
-        u32 hz;
-    } in{module, hz};
-    serviceDispatchIn(&g_sysclk, kSysClkCmdSetOverride, in);
-}
-
-void apply_clocks(bool enable) {
-    std::lock_guard<std::mutex> guard(g_clock_mutex);
-    if (!g_sysclk_open || enable == g_clocks_applied) return;
-    sysclk_set(kSysClkModuleCpu, enable ? g_cpu_hz : 0u);
-    sysclk_set(kSysClkModuleMem, enable ? g_mem_hz : 0u);
-    g_clocks_applied = enable;
-}
-
-void on_applet_hook(AppletHookType hook, void *) {
-    if (hook != AppletHookType_OnFocusState) return;
-    apply_clocks(in_focus() && g_clocks_wanted.load());
-}
-
-void release_clocks_at_exit() {
-    apply_clocks(false);
-    std::lock_guard<std::mutex> guard(g_clock_mutex);
-    if (g_sysclk_open) {
-        serviceClose(&g_sysclk);
-        g_sysclk_open = false;
-    }
-}
-
-void start_clocks() {
-    g_clocks_forbidden = !env_enabled("LCS_NX_OVERCLOCK", true);
-    if (const char *text = std::getenv("LCS_NX_CPU_MHZ")) {
-        const long mhz = std::strtol(text, nullptr, 10);
-        if (mhz >= 612 && mhz <= 2397) g_cpu_hz = static_cast<u32>(mhz) * 1000000u;
-    }
-    if (const char *text = std::getenv("LCS_NX_MEM_MHZ")) {
-        const long mhz = std::strtol(text, nullptr, 10);
-        if (mhz >= 665 && mhz <= 3200) g_mem_hz = static_cast<u32>(mhz) * 1000000u;
-    }
-    appletHook(&g_focus_cookie, on_applet_hook, nullptr);
-    // The overrides themselves follow Settings > Overclock, which the game's
-    // configuration applies through lcs_switch_set_overclock once it is read.
-    if (g_clocks_forbidden) {
-        std::printf("[switch] overclock off (LCS_NX_OVERCLOCK=0)\n");
-    } else if (R_SUCCEEDED(smGetService(&g_sysclk, "sys:clk"))) {
-        g_sysclk_open = true;
-        std::printf("[switch] sys-clk found: CPU %u MHz, memory %u MHz in game when Overclock is on\n",
-                    g_cpu_hz / 1000000u, g_mem_hz / 1000000u);
-    } else {
-        std::printf("[switch] sys-clk not running; stock clocks\n");
-    }
-    // The console's own boost mode: CPU 1785 MHz but the GPU drops to 76.8 MHz,
-    // so it only suits the software renderer. Opt-in.
-    if (env_enabled("LCS_NX_CPU_BOOST", false)) {
-        appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
-        std::printf("[switch] CPU boost mode on (GPU at 76.8 MHz)\n");
-    }
-    std::atexit(release_clocks_at_exit);
 }
 
 // ---------------------------------------------------------------------------
@@ -652,15 +569,6 @@ extern "C" int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *at
     return result;
 }
 
-extern "C" void lcs_switch_set_overclock(bool enabled) {
-    g_clocks_wanted.store(enabled && !g_clocks_forbidden);
-    apply_clocks(g_clocks_wanted.load() && in_focus());
-    std::printf("[switch] overclock %s%s\n", enabled ? "on" : "off",
-                enabled && !g_sysclk_open ? " (sys-clk not running: nothing to do)" : "");
-}
-
-extern "C" bool lcs_switch_sysclk_available() { return g_sysclk_open; }
-
 extern "C" void lcs_switch_name_current_thread(const char *name) {
     const Handle self = threadGetCurHandle();
     {
@@ -708,8 +616,6 @@ extern "C" int __wrap_main(int argc, char **argv) {
         return 1;
     }
 
-    start_clocks();
-
     // The PC main() reads its arguments. Give it absolute, device-free paths.
     static std::string program = in_base("LCSNative.nro");
     static std::string game_root = in_base("game");
@@ -734,7 +640,6 @@ extern "C" int __wrap_main(int argc, char **argv) {
     }
     pthread_attr_destroy(&attr);
     std::printf("[switch] exit code %d\n", args.result);
-    release_clocks_at_exit();
     stop_watch();
     close_log();
     return args.result;

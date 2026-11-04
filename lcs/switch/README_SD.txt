@@ -1,5 +1,5 @@
-LCS Recomp for Nintendo Switch (Atmosphere homebrew)
-=====================================================
+Grand Theft Auto: Liberty City Stories for Nintendo Switch (Atmosphere homebrew)
+================================================================================
 
 GTA: Liberty City Stories, recompiled from the PSP. Game files are not
 included: you need your own copy of the US v1.05 disc (ULUS-10041).
@@ -14,15 +14,15 @@ Install
    sdmc:/switch/LCSNative/game/
 4. Start the homebrew menu THROUGH A GAME (hold R while starting any game),
    not from the Album: only then does the game get the full memory.
-5. Pick "LCS Recomp".
+5. Pick "Grand Theft Auto: Liberty City Stories".
 
 Controls
 --------
 In play, the PSP's buttons are where the Switch's are:
   B = run                    A = attack
   Y = jump                   X = enter or leave a vehicle
-  ZR = accelerate, or aim    ZL = brake, or centre the camera
   R = aim (handbrake)        L = centre the camera, pick up a weapon
+  ZL / ZR = d-pad left / right (Settings > ZL / ZR for other layouts)
   + = pause                  - = change camera
   D-pad left/right = weapon or radio station.
   Left stick moves, right stick looks around.
@@ -34,14 +34,22 @@ Change bindings in LCSNative.ini, section [Controls].
 Settings
 --------
 Press both sticks in (L3 + R3) during play: resolution, view distance, frame
-rate, FPS counter, confirm button, overclock. D-pad to change, B to close.
-Changes are saved; resolution applies at the next start.
+rate, FPS counter, confirm button, ZL / ZR, skip intro. A or the d-pad
+changes a row, B closes. Changes are saved to LCSNative.ini; resolution
+applies at the next start.
+
+Saves
+-----
+Saves live in sdmc:/switch/LCSNative/game/PSP/SAVEDATA/ (one folder per save,
+as on the PSP). "Load game" and saving show the save list: A picks, B goes
+back. Saves from the game's other releases (EU, JP...) are listed too, marked
+with their region; they may not work with this one. Saves made on a real PSP
+are encrypted and cannot be read yet.
 
 Speed
 -----
-If sys-clk is installed (it is in most CFW packs), the game raises the CPU
-to 1785 MHz and the memory to 1600 MHz while it is in focus, and gives the
-clocks back on HOME, sleep and exit. Settings > Overclock turns this off.
+The game does not change the clocks. With sys-clk, set them yourself
+(Ultrahand / sys-clk overlay); a faster CPU helps the most.
 
 Files
 -----

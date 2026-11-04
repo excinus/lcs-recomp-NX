@@ -1284,11 +1284,15 @@ bool present_to_window(GlState &s, GLuint source, std::uint32_t source_width, st
                            screen_height, false);
     }
     if (draw_settings) {
-        const std::int32_t panel_w = std::min(static_cast<std::int32_t>(static_cast<float>(screen_width) * 0.46f),
-                                              static_cast<std::int32_t>(kSettingsOverlayWidth));
+        const bool centered = decision.settings.centered;
+        const float share = centered ? 0.62f : 0.46f;
+        const std::int32_t panel_w = std::min(static_cast<std::int32_t>(static_cast<float>(screen_width) * share),
+                                              static_cast<std::int32_t>(kSettingsOverlayWidth) * (centered ? 2 : 1));
         const std::int32_t panel_h = panel_w / 2;
-        draw_present_layer(s, s.settings_overlay, s.present_linear,
-                           static_cast<std::int32_t>(screen_width) - panel_w - 24, 24, panel_w, panel_h,
+        const std::int32_t x = centered ? (static_cast<std::int32_t>(screen_width) - panel_w) / 2
+                                        : static_cast<std::int32_t>(screen_width) - panel_w - 24;
+        const std::int32_t y = centered ? (static_cast<std::int32_t>(screen_height) - panel_h) / 2 : 24;
+        draw_present_layer(s, s.settings_overlay, s.present_linear, x, y, panel_w, panel_h,
                            screen_width, screen_height, false);
     }
     gl.BindSampler(0u, 0u);
@@ -1798,7 +1802,9 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
     if (!s.enabled || vertex_count == 0u ||
         packed_vertices.size() != static_cast<std::size_t>(vertex_count) * sizeof(Packed0115))
         return false;
-    std::vector<GeGpuVertex> decoded(vertex_count);
+    // Reused between draws: a fresh vector per draw was a heap round trip each time.
+    static thread_local std::vector<GeGpuVertex> decoded;
+    decoded.resize(vertex_count);
     for (std::uint32_t index = 0u; index < vertex_count; ++index) {
         Packed0115 packed{};
         std::memcpy(&packed, packed_vertices.data() + static_cast<std::size_t>(index) * sizeof(Packed0115),

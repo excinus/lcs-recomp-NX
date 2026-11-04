@@ -12,6 +12,8 @@
 #include "lcs_frame_limit.hpp"
 #include "lcs_lang.hpp"
 #include "lcs_menu.hpp"
+#include "lcs_render_config.hpp"
+#include "lcs_save_picker.hpp"
 #include "lcs_stress_test.hpp"
 #include "lcs_switch_hooks.hpp"
 #include "lcs_world_detail.hpp"
@@ -770,6 +772,7 @@ struct SavedataUtilityState {
     UtilityStatus status{UtilityStatus::None};
     std::uint32_t parameter_address{};
     bool operation_complete{};
+    bool picker{};  // LISTLOAD / LISTSAVE: the host's save list is up
 };
 SavedataUtilityState savedata_utility{};
 
@@ -777,6 +780,13 @@ constexpr std::uint32_t kUtilityCommonResultOffset = 0x1Cu;
 constexpr std::uint32_t kSavedataModeOffset = 0x30u;
 constexpr std::uint32_t kSavedataGameNameOffset = 0x3Cu;
 constexpr std::uint32_t kSavedataSaveNameOffset = 0x4Cu;
+constexpr std::uint32_t kSavedataSaveNameListOffset = 0x60u;
+constexpr std::uint32_t kSavedataSfoTitleOffset = 0x80u;
+constexpr std::uint32_t kSavedataSfoSavedataTitleOffset = 0x100u;
+constexpr std::uint32_t kSavedataSfoDetailOffset = 0x180u;
+constexpr std::uint32_t kSavedataSfoParentalOffset = 0x580u;
+constexpr std::uint32_t kSavedataFocusOffset = 0x5C8u;
+constexpr std::uint32_t kUtilityResultCancel = 1u;  // SCE_UTILITY_DIALOG_RESULT_CANCEL
 constexpr std::uint32_t kSavedataFileNameOffset = 0x64u;
 constexpr std::uint32_t kSavedataDataBufferOffset = 0x74u;
 constexpr std::uint32_t kSavedataDataBufferSizeOffset = 0x78u;
@@ -878,6 +888,19 @@ std::uint32_t save_savedata_file(psprecomp::Runtime &runtime, std::uint32_t para
         return raw_mode ? 0x80110328u : 0x80110388u;
     }
     if (!write_guest_file(runtime, path, source, size)) return raw_mode ? 0x80110329u : 0x80110385u;
+    if (!raw_mode && !stress_test_enabled()) {
+        // The PSP writes PARAM.SFO from the game's sfoParam: the save list
+        // shows its title and detail, and PSP emulators can read the save.
+        SaveSfo sfo;
+        sfo.title = read_fixed_string(runtime.memory(), parameter_address + kSavedataSfoTitleOffset, 0x80u);
+        sfo.savedata_title = read_fixed_string(runtime.memory(), parameter_address + kSavedataSfoSavedataTitleOffset, 0x80u);
+        sfo.detail = read_fixed_string(runtime.memory(), parameter_address + kSavedataSfoDetailOffset, 0x400u);
+        sfo.parental_level = runtime.memory().load8(parameter_address + kSavedataSfoParentalOffset);
+        sfo.directory = savedata_directory(runtime, parameter_address).filename().string();
+        const std::vector<std::uint8_t> bytes = build_save_sfo(sfo);
+        std::ofstream output(path.parent_path() / "PARAM.SFO", std::ios::binary | std::ios::trunc);
+        if (output) output.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
     if (!raw_mode) {
         if (!write_savedata_auxiliary(runtime, parameter_address, kSavedataIcon0Offset, "ICON0.PNG") ||
             !write_savedata_auxiliary(runtime, parameter_address, kSavedataIcon1Offset, "ICON1.PMF") ||
@@ -994,6 +1017,57 @@ std::uint32_t query_savedata_sizes(psprecomp::Runtime &runtime, std::uint32_t pa
     return 0u;
 }
 
+std::uint32_t execute_savedata_operation(psprecomp::Runtime &runtime, std::uint32_t parameter_address);
+
+// The slots the game may use (saveNameList: 20-byte names, an empty one ends it).
+std::vector<std::string> read_save_name_list(const psprecomp::GuestMemory &memory, std::uint32_t parameter_address) {
+    std::vector<std::string> names;
+    const std::uint32_t list = memory.load32(parameter_address + kSavedataSaveNameListOffset);
+    if (list == 0u) return names;
+    for (std::uint32_t index = 0u; index < 100u; ++index) {
+        const std::uint32_t entry = list + index * 20u;
+        if (!memory.contains(entry, 20u)) break;
+        const std::string name = safe_savedata_component(read_fixed_string(memory, entry, 20u));
+        if (name.empty()) break;
+        if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+    }
+    return names;
+}
+
+void open_save_picker(psprecomp::Runtime &runtime, std::uint32_t parameter_address, std::uint32_t mode) {
+    const SavePickerMode picker_mode = mode == 4u ? SavePickerMode::Load : SavePickerMode::Save;
+    const std::string game = safe_savedata_component(read_fixed_string(
+        runtime.memory(), parameter_address + kSavedataGameNameOffset, 13u));
+    std::vector<std::string> names = read_save_name_list(runtime.memory(), parameter_address);
+    if (names.empty()) {
+        const std::string proposed = safe_savedata_component(read_fixed_string(
+            runtime.memory(), parameter_address + kSavedataSaveNameOffset, 20u));
+        if (picker_mode == SavePickerMode::Save && !proposed.empty()) names.push_back(proposed);
+    }
+    std::vector<SaveSlot> slots = scan_save_slots(savedata_root(runtime), game, names, picker_mode);
+    const int focus = save_focus_index(slots, runtime.memory().load32(parameter_address + kSavedataFocusOffset));
+    std::cout << "[savedata] " << (picker_mode == SavePickerMode::Load ? "load" : "save") << " list: "
+              << slots.size() << " entries for " << game << " (" << names.size() << " slots)\n" << std::flush;
+    save_picker_begin(picker_mode, std::move(slots), focus);
+}
+
+// The player picked `chosen` in the list: the PSP writes its name into
+// saveName and then loads or saves it.
+std::uint32_t run_picked_savedata_operation(psprecomp::Runtime &runtime, std::uint32_t parameter_address,
+                                            std::uint32_t mode, const SaveSlot &chosen) {
+    std::vector<std::uint8_t> name(20u, 0u);
+    std::copy_n(chosen.slot.begin(), std::min<std::size_t>(chosen.slot.size(), 19u), name.begin());
+    runtime.memory().copy_in(parameter_address + kSavedataSaveNameOffset, name);
+    if (mode != 4u || !chosen.foreign) return execute_savedata_operation(runtime, parameter_address);
+    // Another release's save: read it from its own folder. Saving later
+    // writes this release's folder, so the original stays as it was.
+    const std::string file_name_value = safe_savedata_component(read_fixed_string(
+        runtime.memory(), parameter_address + kSavedataFileNameOffset, 13u));
+    const std::string file_name = file_name_value.empty() ? "DATA.BIN" : file_name_value;
+    std::cout << "[savedata] loading " << chosen.game_id << chosen.slot << " (another release)\n" << std::flush;
+    return load_savedata_file(runtime, parameter_address, chosen.directory / file_name, false);
+}
+
 std::uint32_t execute_savedata_operation(psprecomp::Runtime &runtime, std::uint32_t parameter_address) {
     const std::uint32_t mode = runtime.memory().load32(parameter_address + kSavedataModeOffset);
     if (stress_test_enabled() && stress_savedata_mutates(mode)) {
@@ -1079,6 +1153,28 @@ std::unordered_map<std::int32_t, std::deque<PendingGeCallback>> pending_ge_callb
 
 std::uint64_t virtual_time_us{};
 std::uint64_t umd_stream_flag_last_rearm_us{};
+
+// Settings > Skip intro. The logo and intro videos stop when the player
+// presses a button, so while one plays the game sees short presses of Cross
+// and Start. Only videos in the first minutes count, and only while frames
+// are being decoded: the presses end with the last video.
+std::uint64_t movie_frames_decoded{};
+constexpr std::uint64_t kIntroWindowUs = 180ull * 1000000ull;
+
+std::uint32_t intro_skip_buttons() {
+    static std::uint64_t frames_at_last_read = 0u;
+    static bool pressed_last_read = false;
+    const bool advancing = movie_frames_decoded != frames_at_last_read;
+    frames_at_last_read = movie_frames_decoded;
+    if (!advancing || virtual_time_us > kIntroWindowUs ||
+        !lcs_render_configuration().nx.skip_intro) {
+        pressed_last_read = false;
+        return 0u;
+    }
+    // Press on one read, release on the next: a press is an edge.
+    pressed_last_read = !pressed_last_read;
+    return pressed_last_read ? (0x004000u | 0x000008u) : 0u;  // Cross | Start
+}
 
 constexpr std::uint32_t kGameRenderWidthAddress = 0x08B5698Cu;
 
@@ -1854,12 +1950,14 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
     }
 
     bool presented_gpu_frame = false;
+    static bool showing_guest_frame = false;
     if (ge_gpu_backend_presents_directly()) {
         const bool show_guest = !gpu_frame_ready && !holding_gpu_frame &&
                                 ge_gpu_backend_guest_present_available();
         if (!show_guest) {
             ge_gpu_backend_mark_window_presented();
             presented_gpu_frame = true;
+            showing_guest_frame = false;
         }
     } else if ((gpu_frame_ready || holding_gpu_frame) && ge_gpu_backend_active()) {
         const GeGpuBackendReport gpu = ge_gpu_backend_report();
@@ -1890,8 +1988,22 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
         }
     }
     if (!presented_gpu_frame) {
-        display_window_present(rt, present_buffer, present_stride, request.pixel_format,
-                               present_width, present_height);
+        if (ge_gpu_backend_presents_directly()) {
+            // No GPU frame for a while: the game is drawing the screen itself
+            // (the loading screens between islands). Its picture is in the
+            // buffer it displays. The last GE target's memory is not written
+            // when the GPU renders, so it holds an old, broken image.
+            if (!showing_guest_frame) {
+                showing_guest_frame = true;
+                std::cout << "[present] no GPU frame: showing the game's framebuffer 0x" << std::hex
+                          << request.display_buffer << std::dec << "\n" << std::flush;
+            }
+            display_window_present(rt, request.display_buffer, request.display_stride, request.pixel_format,
+                                   request.display_width, request.display_height);
+        } else {
+            display_window_present(rt, present_buffer, present_stride, request.pixel_format,
+                                   present_width, present_height);
+        }
     }
 }
 
@@ -1972,6 +2084,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     umd_callback_notified = false;
     general_purpose_io = 0u;
     savedata_utility = SavedataUtilityState{};
+    save_picker_abort();
     ge_worker_stop();
     pending_ge_callbacks.clear();
     mpeg_contexts.clear();
@@ -3245,7 +3358,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const HostInputState host = stress_test_enabled()
                 ? stress_test_input(rt, {}) : display_window_input();
-            const std::uint32_t buttons = host.buttons;
+            const std::uint32_t buttons = host.buttons | (stress_test_enabled() ? 0u : intro_skip_buttons());
             for (std::uint32_t index = 0u; index < count; ++index) {
                 const std::uint32_t sample = destination + index * sample_size;
                 rt.memory().store32(sample, static_cast<std::uint32_t>(system_time_microseconds()));
@@ -3494,6 +3607,12 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             savedata_utility = SavedataUtilityState{UtilityStatus::Init, parameter, false};
             rt.memory().store32(parameter + kUtilityCommonResultOffset, 0u);
+            // LISTLOAD / LISTSAVE: on a PSP the system shows the save list.
+            const std::uint32_t mode = rt.memory().load32(parameter + kSavedataModeOffset);
+            if ((mode == 4u || mode == 5u) && save_picker_enabled() && !stress_test_enabled()) {
+                open_save_picker(rt, parameter, mode);
+                savedata_utility.picker = true;
+            }
             set_success(ctx);
         });
     runtime.register_hle("sceUtility", 0xD4B95FFBu,
@@ -3505,7 +3624,26 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (savedata_utility.status == UtilityStatus::Init) {
                 savedata_utility.status = UtilityStatus::Visible;
             } else if (savedata_utility.status == UtilityStatus::Visible && !savedata_utility.operation_complete) {
-                const std::uint32_t result = execute_savedata_operation(rt, savedata_utility.parameter_address);
+                const std::uint32_t parameter = savedata_utility.parameter_address;
+                std::uint32_t result = 0u;
+                if (savedata_utility.picker) {
+                    SaveSlot chosen;
+                    const SavePickerOutcome outcome = save_picker_take(chosen);
+                    if (outcome == SavePickerOutcome::Pending) {
+                        set_success(ctx);
+                        return;
+                    }
+                    const std::uint32_t mode = rt.memory().load32(parameter + kSavedataModeOffset);
+                    result = outcome == SavePickerOutcome::Cancelled
+                        ? kUtilityResultCancel
+                        : run_picked_savedata_operation(rt, parameter, mode, chosen);
+                    std::cout << "[savedata] list answered: "
+                              << (outcome == SavePickerOutcome::Cancelled ? std::string("cancel")
+                                                                          : chosen.game_id + chosen.slot)
+                              << " result 0x" << std::hex << result << std::dec << "\n" << std::flush;
+                } else {
+                    result = execute_savedata_operation(rt, parameter);
+                }
                 rt.memory().store32(savedata_utility.parameter_address + kUtilityCommonResultOffset, result);
                 savedata_utility.operation_complete = true;
                 savedata_utility.status = UtilityStatus::Quit;
@@ -3529,6 +3667,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             savedata_utility.status = UtilityStatus::Finished;
+            if (savedata_utility.picker) save_picker_abort();
             set_success(ctx);
         });
 
@@ -4363,6 +4502,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     std::span<const std::uint8_t>(frame.data() + y * source_stride, source_stride));
             }
             rt.memory().store32(status_pointer, 1u);
+            ++movie_frames_decoded;
             set_success(ctx);
         });
 

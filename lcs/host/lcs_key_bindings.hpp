@@ -589,12 +589,17 @@ PadSample sample_pad(const ControlBindings &bindings, bool driving, IsDown &&is_
     for (std::uint8_t index = 0; index < static_cast<std::uint8_t>(PadButton::Count); ++index) {
         const auto button = static_cast<PadButton>(index);
         if (!is_down(button)) continue;
-        const bool trigger = pad_button_is_trigger(button);
+        // A trigger that accelerates or brakes sends nothing else in a
+        // vehicle (its on-foot aim must not fire). Other triggers (the
+        // Switch's d-pad layout) behave as any button.
+        const bool drive_trigger = pad_button_is_trigger(button) &&
+            (pad_has(bindings, button, BindAction::MoveForward) ||
+             pad_has(bindings, button, BindAction::MoveBack));
         for (std::uint8_t slot = 0; slot < bindings.pad_count[index]; ++slot) {
             const BindAction action = bindings.pad[index][slot];
             if (action == BindAction::MoveForward) sample.accelerate = true;
             else if (action == BindAction::MoveBack) sample.brake = true;
-            else if (!trigger || !driving) sample.buttons |= pad_action_buttons(action);
+            else if (!drive_trigger || !driving) sample.buttons |= pad_action_buttons(action);
         }
     }
     return sample;

@@ -222,15 +222,26 @@ void poll_switch_settings_combo() noexcept {
 
 void handle_switch_pad_button(std::uint8_t button) noexcept {
     if (!host_settings_open()) return;
+    // SDL names the buttons by position: SDL "A" is the bottom one (Switch B),
+    // SDL "B" the right one (Switch A). The confirm button follows Settings >
+    // Confirm button, as in the game's menus.
+    const bool nintendo = lcs_render_configuration().nx.nintendo_confirm;
+    const std::uint8_t confirm = nintendo ? SDL_CONTROLLER_BUTTON_B : SDL_CONTROLLER_BUTTON_A;
+    const std::uint8_t back = nintendo ? SDL_CONTROLLER_BUTTON_A : SDL_CONTROLLER_BUTTON_B;
+    if (button == confirm) {
+        host_settings_handle(HostSettingsKey::Confirm);
+        return;
+    }
+    if (button == back) {
+        host_settings_handle(HostSettingsKey::Close);
+        if (!host_settings_open()) discard_pending_pointer();
+        return;
+    }
     switch (button) {
     case SDL_CONTROLLER_BUTTON_DPAD_UP: host_settings_handle(HostSettingsKey::Up); break;
     case SDL_CONTROLLER_BUTTON_DPAD_DOWN: host_settings_handle(HostSettingsKey::Down); break;
     case SDL_CONTROLLER_BUTTON_DPAD_LEFT: host_settings_handle(HostSettingsKey::Left); break;
     case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: host_settings_handle(HostSettingsKey::Right); break;
-    case SDL_CONTROLLER_BUTTON_A:
-        host_settings_handle(HostSettingsKey::Close);
-        discard_pending_pointer();
-        break;
     default: break;
     }
 }
@@ -252,6 +263,8 @@ void pump_events() noexcept {
             else if (code == SDL_SCANCODE_DOWN) host_settings_handle(HostSettingsKey::Down);
             else if (code == SDL_SCANCODE_LEFT) host_settings_handle(HostSettingsKey::Left);
             else if (code == SDL_SCANCODE_RIGHT) host_settings_handle(HostSettingsKey::Right);
+            else if ((code == SDL_SCANCODE_RETURN || code == SDL_SCANCODE_KP_ENTER) && event.key.repeat == 0)
+                host_settings_handle(HostSettingsKey::Confirm);
             else if (code == SDL_SCANCODE_ESCAPE) {
                 host_settings_handle(HostSettingsKey::Close);
                 discard_pending_pointer();
@@ -394,8 +407,9 @@ void paint_host_settings(SDL_Renderer *renderer) noexcept {
     const int panel_w = 42 * 6 * scale;
     const int panel_h = 16 * 8 * scale;
     const int margin = 8 * scale;
-    const int origin_x = std::max(margin, output_w - panel_w - margin);
-    const int origin_y = margin;
+    const int origin_x = view.centered ? std::max(margin, (output_w - panel_w) / 2)
+                                       : std::max(margin, output_w - panel_w - margin);
+    const int origin_y = view.centered ? std::max(margin, (output_h - panel_h) / 2) : margin;
     SDL_SetRenderDrawColor(renderer, 8, 12, 28, 230);
     fill_rect(renderer, origin_x, origin_y, panel_w, panel_h);
     SDL_SetRenderDrawColor(renderer, 180, 200, 230, 255);
@@ -412,11 +426,11 @@ void paint_host_settings(SDL_Renderer *renderer) noexcept {
         }
         draw_text(renderer, origin_x + 8 * scale, y, scale, view.rows[row]);
     }
-    if (view.resolution_pending) {
-        SDL_SetRenderDrawColor(renderer, 220, 180, 80, 255);
+    SDL_SetRenderDrawColor(renderer, 220, 180, 80, 255);
+    for (int line = 0; line < 2; ++line) {
         draw_text(renderer, origin_x + 8 * scale,
-                  origin_y + (28 + std::clamp(view.row_count, 0, kHostSettingsMaxRows) * 12) * scale,
-                  scale, "RESTART TO APPLY");
+                  origin_y + (28 + (std::clamp(view.row_count, 0, kHostSettingsMaxRows) + line) * 12) * scale,
+                  scale, view.footer[line]);
     }
 }
 

@@ -215,18 +215,20 @@ void paint_host_overlay(HDC hdc) noexcept {
     if (host_settings_open()) {
         const HostSettingsView view = host_settings_view();
         const int line = font_h + 8;
-        const int panel_w = font_h * 22;
-        const int panel_h = line * 10;
-        const int origin_x = std::max(12, client_w - panel_w - 12);
-        const int origin_y = 12;
+        const int panel_w = font_h * 26;
+        const int panel_h = line * 12;
+        const int origin_x = view.centered ? std::max(12, (client_w - panel_w) / 2)
+                                           : std::max(12, client_w - panel_w - 12);
+        const int origin_y = view.centered ? std::max(12, (client_h - panel_h) / 2) : 12;
         RECT panel{origin_x, origin_y, origin_x + panel_w, origin_y + panel_h};
         HBRUSH background = CreateSolidBrush(RGB(8, 12, 28));
         FillRect(hdc, &panel, background);
         DeleteObject(background);
         SetTextColor(hdc, RGB(180, 200, 230));
-        TextOutA(hdc, origin_x + 12, origin_y + 8, "HOST SETTINGS", 13);
-        TextOutA(hdc, origin_x + 12, origin_y + 8 + line, "F10 CLOSE", 9);
-        for (int row = 0; row < 5; ++row) {
+        TextOutA(hdc, origin_x + 12, origin_y + 8, view.title, static_cast<int>(std::strlen(view.title)));
+        TextOutA(hdc, origin_x + 12, origin_y + 8 + line, view.hint, static_cast<int>(std::strlen(view.hint)));
+        const int rows = std::clamp(view.row_count, 0, kHostSettingsMaxRows);
+        for (int row = 0; row < rows; ++row) {
             const int y = origin_y + 8 + line * (2 + row);
             if (row == view.selected) {
                 RECT highlight{origin_x + 6, y - 2, origin_x + panel_w - 6, y + font_h + 4};
@@ -239,9 +241,10 @@ void paint_host_overlay(HDC hdc) noexcept {
             }
             TextOutA(hdc, origin_x + 12, y, view.rows[row], static_cast<int>(std::strlen(view.rows[row])));
         }
-        if (view.resolution_pending) {
-            SetTextColor(hdc, RGB(220, 180, 80));
-            TextOutA(hdc, origin_x + 12, origin_y + 8 + line * 7, "RESTART TO APPLY", 16);
+        SetTextColor(hdc, RGB(220, 180, 80));
+        for (int index = 0; index < 2; ++index) {
+            TextOutA(hdc, origin_x + 12, origin_y + 8 + line * (2 + rows + index), view.footer[index],
+                     static_cast<int>(std::strlen(view.footer[index])));
         }
     }
     SelectObject(hdc, previous);
@@ -294,6 +297,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             else if (wparam == VK_DOWN) host_settings_handle(HostSettingsKey::Down);
             else if (wparam == VK_LEFT) host_settings_handle(HostSettingsKey::Left);
             else if (wparam == VK_RIGHT) host_settings_handle(HostSettingsKey::Right);
+            else if (wparam == VK_RETURN && !repeat) host_settings_handle(HostSettingsKey::Confirm);
             else if (wparam == VK_ESCAPE && !repeat) {
                 host_settings_handle(HostSettingsKey::Close);
                 discard_pending_pointer();

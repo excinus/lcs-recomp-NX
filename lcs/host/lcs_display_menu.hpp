@@ -12,6 +12,7 @@ enum class HostSettingsKey {
     Left,
     Right,
     Close,
+    Confirm,  // Enter / the confirm button: change the row, or pick the entry
 };
 
 inline constexpr int kHostSettingsMaxRows = 8;
@@ -23,8 +24,13 @@ struct HostSettingsView {
     bool resolution_pending{false};
     const char *title{"HOST SETTINGS"};
     const char *hint{"F10 CLOSE"};
+    // Lines under the rows (the save list's details, "RESTART TO APPLY").
+    char footer[2][48]{};
+    // Middle of the screen (save list) instead of the top right corner.
+    bool centered{false};
 };
 
+// True while the settings panel or the save list is up. Game input stops.
 [[nodiscard]] bool host_settings_open() noexcept;
 bool host_settings_handle(HostSettingsKey key) noexcept;
 void host_settings_note_fullscreen(bool enabled) noexcept;

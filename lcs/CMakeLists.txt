@@ -157,6 +157,7 @@ if(NOT NINTENDO_SWITCH)
 add_executable(lcs_host_menu_test
     ${CMAKE_SOURCE_DIR}/tests/lcs_host_menu_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_display_menu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_save_picker.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_render_config.cpp)
 target_include_directories(lcs_host_menu_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/host
@@ -165,6 +166,11 @@ if(WIN32)
     target_link_libraries(lcs_host_menu_test PRIVATE user32)
 else()
     target_link_libraries(lcs_host_menu_test PRIVATE PkgConfig::SDL2 Threads::Threads)
+endif()
+if(PSPRECOMP_BUILD_TESTS)
+    foreach(_mode menu present f10 bindings fps persist triggers saves)
+        add_test(NAME lcs_host_menu_${_mode} COMMAND lcs_host_menu_test ${_mode})
+    endforeach()
 endif()
 endif()
 
@@ -186,12 +192,19 @@ if(PSPRECOMP_BUILD_TESTS)
             host/lcs_prompt_textures.cpp
             host/lcs_render_config.cpp
             host/lcs_display_menu.cpp
+            host/lcs_save_picker.cpp
             host/lcs_runtime_log.cpp)
         target_compile_definitions(lcs_ge_gl_backend_test PRIVATE LCS_GL_GE_BACKEND=1)
         target_include_directories(lcs_ge_gl_backend_test PRIVATE host ${CMAKE_SOURCE_DIR}/include)
         target_link_libraries(lcs_ge_gl_backend_test PRIVATE PkgConfig::SDL2 Threads::Threads)
         add_test(NAME lcs_ge_gl_backend_test COMMAND lcs_ge_gl_backend_test)
         set_tests_properties(lcs_ge_gl_backend_test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    if(NOT WIN32)
+        # The Switch build's allocator (lcs/switch/switch_malloc.cpp) over a fake heap.
+        add_executable(lcs_switch_malloc_test ${CMAKE_SOURCE_DIR}/tests/switch_malloc_test.cpp)
+        target_link_libraries(lcs_switch_malloc_test PRIVATE Threads::Threads)
+        add_test(NAME lcs_switch_malloc_test COMMAND lcs_switch_malloc_test)
     endif()
     add_executable(lcs_stress_safety_test ${CMAKE_SOURCE_DIR}/tests/lcs_stress_safety_test.cpp)
     target_link_libraries(lcs_stress_safety_test PRIVATE lcs_host)

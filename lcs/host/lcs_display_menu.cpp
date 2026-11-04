@@ -3,7 +3,7 @@
 #include "display_window.hpp"
 #include "host_font_5x7.hpp"
 #include "lcs_render_config.hpp"
-#include "lcs_switch_hooks.hpp"
+#include "lcs_save_picker.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -58,12 +58,15 @@ enum class Row {
     FpsCounter,
     FrameRate,
     ConfirmButton,
-    Overclock,
+    Triggers,
+    SkipIntro,
 };
 
 #if defined(__SWITCH__)
-constexpr Row kRows[] = {Row::Resolution, Row::ViewDistance, Row::FrameRate,
-                         Row::FpsCounter, Row::ConfirmButton, Row::Overclock};
+constexpr Row kRows[] = {Row::Resolution, Row::ViewDistance, Row::FrameRate, Row::FpsCounter,
+                         Row::ConfirmButton, Row::Triggers, Row::SkipIntro};
+constexpr SwitchTriggerMode kTriggerModes[] = {SwitchTriggerMode::Dpad, SwitchTriggerMode::Drive,
+                                               SwitchTriggerMode::Shoulders};
 #else
 constexpr Row kRows[] = {Row::ViewDistance, Row::Fullscreen, Row::Resolution,
                          Row::FpsCounter, Row::FrameRate};
@@ -221,15 +224,21 @@ bool upsert_ini_line(std::string &file, const std::string &section, const std::s
 void save_settings() {
     const LcsConfiguration &config = lcs_render_configuration();
     if (config.source_path.empty()) return;
-    std::ifstream input(config.source_path);
-    if (!input) return;
-    std::string file((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    std::string file;
+    {
+        // Closed before the file is written again: the Switch's file system
+        // will not open a file for writing while another handle has it open.
+        std::ifstream input(config.source_path, std::ios::binary);
+        if (!input) return;
+        file.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    }
     char distance[16];
     std::snprintf(distance, sizeof(distance), "%.2f", view_distance_scale());
     const RenderingConfiguration &rendering = config.rendering;
 #if defined(__SWITCH__)
     upsert_ini_line(file, "switch", "ConfirmButton", config.nx.nintendo_confirm ? "A" : "B");
-    upsert_ini_line(file, "switch", "Overclock", config.nx.overclock ? "true" : "false");
+    upsert_ini_line(file, "switch", "Triggers", switch_trigger_mode_name(config.nx.triggers));
+    upsert_ini_line(file, "switch", "SkipIntro", config.nx.skip_intro ? "true" : "false");
 #else
     upsert_ini_line(file, "display", "Fullscreen", config.display.fullscreen ? "true" : "false");
 #endif
@@ -243,8 +252,17 @@ void save_settings() {
     }
     upsert_ini_line(file, "display", "ShowFPS", config.display.show_fps ? "true" : "false");
     upsert_ini_line(file, "timing", "FrameRate", std::to_string(config.timing.frame_rate));
-    std::ofstream output(config.source_path, std::ios::trunc);
-    if (output) output << file;
+    bool written = false;
+    {
+        std::ofstream output(config.source_path, std::ios::binary | std::ios::trunc);
+        if (output) {
+            output << file;
+            output.flush();
+            written = output.good();
+        }
+    }
+    if (!written)
+        std::fprintf(stderr, "[settings] could not write %s\n", config.source_path.string().c_str());
 }
 
 void change_selected(int direction) noexcept {
@@ -280,14 +298,19 @@ void change_selected(int direction) noexcept {
     case Row::ConfirmButton:
         lcs_set_nintendo_confirm(!lcs_render_configuration().nx.nintendo_confirm);
         break;
-    case Row::Overclock: {
-        const bool enabled = !lcs_render_configuration().nx.overclock;
-        lcs_set_overclock(enabled);
+    case Row::Triggers: {
 #if defined(__SWITCH__)
-        lcs_switch_set_overclock(enabled);
+        const int count = static_cast<int>(std::size(kTriggerModes));
+        int index = 0;
+        for (int candidate = 0; candidate < count; ++candidate)
+            if (kTriggerModes[candidate] == lcs_render_configuration().nx.triggers) index = candidate;
+        lcs_set_switch_triggers(kTriggerModes[step_index(index, count, direction)]);
 #endif
         break;
     }
+    case Row::SkipIntro:
+        lcs_set_skip_intro(!lcs_render_configuration().nx.skip_intro);
+        break;
     }
     save_settings();
 }
@@ -319,20 +342,22 @@ void format_row(Row row, char *text, std::size_t size, bool resolution_pending) 
     case Row::ConfirmButton:
         std::snprintf(text, size, "Confirm button  %s", config.nx.nintendo_confirm ? "A" : "B");
         break;
-    case Row::Overclock:
-#if defined(__SWITCH__)
-        std::snprintf(text, size, "Overclock       %s", !config.nx.overclock ? "Off"
-                      : lcs_switch_sysclk_available() ? "On" : "On - no sys-clk");
-#else
-        std::snprintf(text, size, "Overclock       %s", config.nx.overclock ? "On" : "Off");
-#endif
+    case Row::Triggers: {
+        const char *label = "D-pad left/right";
+        if (config.nx.triggers == SwitchTriggerMode::Drive) label = "Drive and aim";
+        else if (config.nx.triggers == SwitchTriggerMode::Shoulders) label = "L and R";
+        std::snprintf(text, size, "ZL / ZR         %s", label);
+        break;
+    }
+    case Row::SkipIntro:
+        std::snprintf(text, size, "Skip intro      %s", config.nx.skip_intro ? "On" : "Off");
         break;
     }
 }
 
 }  // namespace
 
-bool host_settings_open() noexcept { return g_open; }
+bool host_settings_open() noexcept { return g_open || save_picker_active(); }
 
 void host_settings_note_fullscreen(bool enabled) noexcept {
     lcs_set_fullscreen_setting(enabled);
@@ -340,6 +365,8 @@ void host_settings_note_fullscreen(bool enabled) noexcept {
 }
 
 bool host_settings_handle(HostSettingsKey key) noexcept {
+    // The save list, while the game waits on it, takes every key.
+    if (save_picker_active()) return save_picker_handle(key);
     remember_applied_resolution();
     if (key == HostSettingsKey::Toggle) {
         g_open = !g_open;
@@ -354,6 +381,7 @@ bool host_settings_handle(HostSettingsKey key) noexcept {
     else if (key == HostSettingsKey::Down) g_selected = step_index(g_selected, kRowCount, 1);
     else if (key == HostSettingsKey::Left) change_selected(-1);
     else if (key == HostSettingsKey::Right) change_selected(1);
+    else if (key == HostSettingsKey::Confirm) change_selected(1);
     return true;
 }
 
@@ -474,9 +502,9 @@ void rasterize_settings_overlay(const HostSettingsView &view, std::uint8_t *rgba
         overlay_text(rgba, width, height, 8 * scale, y, scale, view.rows[row], tone,
                      row == view.selected ? 255u : 190u, row == view.selected ? 255u : 220u);
     }
-    if (view.resolution_pending) {
-        overlay_text(rgba, width, height, 8 * scale, 6 * scale + line * (2 + rows), scale,
-                     "RESTART TO APPLY", 220u, 180u, 80u);
+    for (int index = 0; index < 2; ++index) {
+        overlay_text(rgba, width, height, 8 * scale, 6 * scale + line * (2 + rows + index), scale,
+                     view.footer[index], 220u, 180u, 80u);
     }
 }
 
@@ -492,6 +520,7 @@ void rasterize_fps_overlay(std::uint8_t *rgba, std::uint32_t width,
 }
 
 HostSettingsView host_settings_view() noexcept {
+    if (save_picker_active()) return save_picker_view();
     remember_applied_resolution();
     HostSettingsView view{};
     view.selected = g_selected;
@@ -499,8 +528,10 @@ HostSettingsView host_settings_view() noexcept {
     view.row_count = kRowCount;
 #if defined(__SWITCH__)
     view.title = "SETTINGS";
-    view.hint = "L3+R3 OR B TO CLOSE";
+    view.hint = lcs_render_configuration().nx.nintendo_confirm ? "A OR D-PAD CHANGE   B CLOSE"
+                                                               : "B OR D-PAD CHANGE   A CLOSE";
 #endif
+    if (view.resolution_pending) std::snprintf(view.footer[0], sizeof(view.footer[0]), "RESTART TO APPLY");
     for (int row = 0; row < kRowCount; ++row)
         format_row(kRows[row], view.rows[row], sizeof(view.rows[row]), view.resolution_pending);
     return view;

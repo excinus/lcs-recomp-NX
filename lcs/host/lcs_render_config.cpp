@@ -429,11 +429,21 @@ void apply_switch_key(LcsConfiguration &config, const std::string &key,
         else warning(config, line, "Switch.ConfirmButton expects A or B");
         return;
     }
-    if (key == "overclock") {
-        if (!parse_bool(value, config.nx.overclock))
-            warning(config, line, "Switch.Overclock expects true/false");
+    if (key == "triggers" || key == "zlzr") {
+        const std::string mode = lowercase_copy(trim_copy(value));
+        if (mode == "dpad" || mode == "d-pad") config.nx.triggers = SwitchTriggerMode::Dpad;
+        else if (mode == "drive") config.nx.triggers = SwitchTriggerMode::Drive;
+        else if (mode == "shoulders" || mode == "lr" || mode == "l/r") config.nx.triggers = SwitchTriggerMode::Shoulders;
+        else warning(config, line, "Switch.Triggers expects Dpad, Drive or Shoulders");
         return;
     }
+    if (key == "skipintro") {
+        if (!parse_bool(value, config.nx.skip_intro))
+            warning(config, line, "Switch.SkipIntro expects true/false");
+        return;
+    }
+    // Earlier builds asked sys-clk for clocks; that is now left to the player.
+    if (key == "overclock") return;
     warning(config, line, "unknown [Switch] key '" + key + "'");
 }
 
@@ -573,9 +583,48 @@ void lcs_set_nintendo_confirm(bool enabled) noexcept {
     global_configuration().nx.nintendo_confirm = enabled;
 }
 
-void lcs_set_overclock(bool enabled) noexcept {
+const char *switch_trigger_mode_name(SwitchTriggerMode mode) noexcept {
+    switch (mode) {
+    case SwitchTriggerMode::Dpad: return "Dpad";
+    case SwitchTriggerMode::Drive: return "Drive";
+    case SwitchTriggerMode::Shoulders: return "Shoulders";
+    }
+    return "Dpad";
+}
+
+void apply_switch_trigger_mode(ControlBindings &bindings, SwitchTriggerMode mode) noexcept {
+    const auto set = [&](PadButton button, BindAction first, BindAction second, std::uint8_t count) {
+        const auto index = static_cast<std::size_t>(button);
+        bindings.pad[index][0] = first;
+        bindings.pad[index][1] = second;
+        bindings.pad_count[index] = count;
+    };
+    switch (mode) {
+    case SwitchTriggerMode::Dpad:
+        set(PadButton::LeftTrigger, BindAction::WeaponPrevious, BindAction::WeaponPrevious, 1u);
+        set(PadButton::RightTrigger, BindAction::WeaponNext, BindAction::WeaponNext, 1u);
+        break;
+    case SwitchTriggerMode::Drive:
+        set(PadButton::LeftTrigger, BindAction::MoveBack, BindAction::CenterCamera, 2u);
+        set(PadButton::RightTrigger, BindAction::MoveForward, BindAction::Aim, 2u);
+        break;
+    case SwitchTriggerMode::Shoulders:
+        set(PadButton::LeftTrigger, BindAction::CenterCamera, BindAction::CenterCamera, 1u);
+        set(PadButton::RightTrigger, BindAction::Aim, BindAction::Aim, 1u);
+        break;
+    }
+}
+
+void lcs_set_switch_triggers(SwitchTriggerMode mode) noexcept {
     std::lock_guard<std::mutex> guard(global_configuration_mutex());
-    global_configuration().nx.overclock = enabled;
+    LcsConfiguration &config = global_configuration();
+    config.nx.triggers = mode;
+    apply_switch_trigger_mode(config.controls.bindings, mode);
+}
+
+void lcs_set_skip_intro(bool enabled) noexcept {
+    std::lock_guard<std::mutex> guard(global_configuration_mutex());
+    global_configuration().nx.skip_intro = enabled;
 }
 
 void lcs_set_frame_rate(std::uint32_t frame_rate) noexcept {
@@ -747,6 +796,11 @@ void initialize_lcs_render_configuration(const std::filesystem::path &executable
     }
 
     LcsConfiguration loaded = load_lcs_render_configuration(path);
+#if defined(__SWITCH__)
+    // On the Switch, [Switch] Triggers (the settings panel's ZL / ZR row)
+    // decides what the triggers do.
+    apply_switch_trigger_mode(loaded.controls.bindings, loaded.nx.triggers);
+#endif
     loaded.initialized = true;
     loaded.executable_directory = executable_directory;
     {
@@ -775,9 +829,6 @@ void initialize_lcs_render_configuration(const std::filesystem::path &executable
     if (std::getenv("PSPRECOMP_GE_GPU_TEXTURE_CACHE_MB") == nullptr)
         set_environment_value("PSPRECOMP_GE_GPU_TEXTURE_CACHE_MB",
                               std::to_string(config.rendering.texture_cache_mb));
-#if defined(__SWITCH__)
-    lcs_switch_set_overclock(config.nx.overclock);
-#endif
 }
 
 const LcsConfiguration &lcs_render_configuration() {

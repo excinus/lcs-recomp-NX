@@ -9,9 +9,13 @@
 # or the OpenGL backend when LCS_SWITCH_OPENGL is ON.
 
 set(LCS_SWITCH_DIR ${CMAKE_CURRENT_LIST_DIR})
-set(LCS_SWITCH_TITLE "LCS Recomp" CACHE STRING "Title shown in the homebrew menu")
-set(LCS_SWITCH_AUTHOR "elmasas, Switch port" CACHE STRING "Author shown in the homebrew menu")
-set(LCS_SWITCH_VERSION "${PROJECT_VERSION}" CACHE STRING "Version shown in the homebrew menu")
+# The homebrew menu's title, author and version (not cached, so an old build
+# folder cannot keep stale ones).
+set(LCS_SWITCH_TITLE "Grand Theft Auto: Liberty City Stories")
+set(LCS_SWITCH_AUTHOR "excinus")
+set(LCS_SWITCH_APP_VERSION "1.0.0")
+# The build's own name, printed at the top of lcs_log.txt (CI: 1.0.0-<commit>).
+set(LCS_SWITCH_VERSION "${LCS_SWITCH_APP_VERSION}" CACHE STRING "Build name written to the log")
 option(LCS_SWITCH_OPENGL "Build the OpenGL GE backend (Mesa) for the Switch" ON)
 
 find_package(PkgConfig REQUIRED)
@@ -20,7 +24,8 @@ pkg_check_modules(NX_FFMPEG REQUIRED IMPORTED_TARGET
 pkg_check_modules(NX_SDL2 REQUIRED IMPORTED_TARGET sdl2)
 
 target_sources(lcs_host PRIVATE
-    ${LCS_SWITCH_DIR}/switch_platform.cpp)
+    ${LCS_SWITCH_DIR}/switch_platform.cpp
+    ${LCS_SWITCH_DIR}/switch_malloc.cpp)
 set_source_files_properties(${LCS_SWITCH_DIR}/switch_platform.cpp PROPERTIES
     COMPILE_DEFINITIONS "LCS_SWITCH_VERSION_STRING=\"${LCS_SWITCH_VERSION}\"")
 if(LCS_SWITCH_OPENGL AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/host/ge_gpu_backend_gl.cpp)
@@ -39,9 +44,17 @@ target_link_libraries(lcs_host PUBLIC PkgConfig::NX_FFMPEG PkgConfig::NX_SDL2)
 #   Horizon starts a new thread on the process's default core (0) and never
 #   moves it, so without this the GE and raster workers would share the game's
 #   core.
+# --wrap=_malloc_r and the rest: switch_malloc.cpp's size classes in front of
+#   newlib's allocator (malloc, free, new and delete all land there).
 target_link_options(LCSNative PRIVATE
     -Wl,--wrap=main
     -Wl,--wrap=pthread_create
+    -Wl,--wrap=_malloc_r
+    -Wl,--wrap=_free_r
+    -Wl,--wrap=_realloc_r
+    -Wl,--wrap=_calloc_r
+    -Wl,--wrap=_memalign_r
+    -Wl,--wrap=_malloc_usable_size_r
     -Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/LCSNative.map)
 
 set_target_properties(LCSNative PROPERTIES SUFFIX ".elf")
@@ -49,7 +62,7 @@ set_target_properties(LCSNative PROPERTIES SUFFIX ".elf")
 nx_generate_nacp(LCSNative.nacp
     NAME "${LCS_SWITCH_TITLE}"
     AUTHOR "${LCS_SWITCH_AUTHOR}"
-    VERSION "${LCS_SWITCH_VERSION}")
+    VERSION "${LCS_SWITCH_APP_VERSION}")
 
 nx_create_nro(LCSNative
     ICON ${LCS_SWITCH_DIR}/icon.jpg

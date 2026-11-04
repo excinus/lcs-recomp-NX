@@ -11,7 +11,7 @@ Player instructions: [`README_SD.txt`](README_SD.txt) (it ships in the zip).
 | Phase | State |
 | --- | --- |
 | Builds for the Switch (devkitA64 GCC 15, libnx, SDL2, FFmpeg, Mesa) | Done, in CI (`.github/workflows/switch.yml`) |
-| Platform layer: paths, log, env file, threads/cores, big game stack, sys-clk, applet focus | Written, not yet run on a console |
+| Platform layer: paths, log, env file, threads/cores, big game stack, profiler | Written, not yet run on a console |
 | Picture: OpenGL GE backend (Switch GPU) | Written; renders the same pixels as the Vulkan backend on desktop Mesa (see Testing) |
 | Picture: software GE + SDL GLES2 presenter | Unchanged PC code, presented through SDL's GPU renderer |
 | Sound (SDL audio), controllers (SDL game controller) | PC code through devkitPro's SDL2 |
@@ -61,11 +61,26 @@ Small `__SWITCH__` changes in shared code:
   attributes; SDL's accelerated renderer for the software path; touch does not
   become mouse input (it would turn the camera and fire); every connected
   controller drives the game; L3 + R3 opens the settings panel (the PC's F10)
-  and neither click reaches the game while both are held; d-pad moves, B
-  closes; in menus A and B trade places when `[Switch] ConfirmButton=A`.
+  and neither click reaches the game while both are held; d-pad moves, the
+  confirm button (A, or B with `ConfirmButton=B`) changes a row or picks a
+  save, the other closes; in menus A and B trade places when
+  `[Switch] ConfirmButton=A`.
 - `lcs_display_menu.cpp`: the panel is a row table. The Switch rows are
   resolution (1x-3x only), view distance (1-2), frame rate, FPS counter,
-  confirm button and overclock; the PC keeps its five rows.
+  confirm button, ZL / ZR and skip intro; the PC keeps its five rows. The ini
+  is read in full and closed before it is written again (Horizon refuses to
+  open a file for writing while another handle has it open, which is why the
+  first builds lost every change).
+- `lcs_save_picker.cpp`: the PSP's save list for `sceUtilitySavedata`
+  LISTLOAD / LISTSAVE (the game's "Load game" and save prompts). The game
+  only names its slots (`saveNameList`); the list shows them with the
+  `PARAM.SFO` title and detail and the file date, asks before overwriting,
+  and writes the chosen slot into `saveName`. Saves of the game's other
+  releases (EU, JP disc IDs, or a `PARAM.SFO` titled Liberty City) are listed
+  for loading; they are read from their own folder and saved back under this
+  release's ID. PSP-encrypted saves (`SAVEDATA_PARAMS`, or a `DATA.BIN` that
+  is noise) are shown but refused. Saves now get a `PARAM.SFO`. Off on the PC
+  unless `LCS_SAVE_PICKER=1`.
 - `lcs_prompt_textures.cpp`: `ButtonPrompts=Switch` paints A/B/X/Y over the
   PSP glyphs as each texture is decoded (no files from the disc needed; also
   works on PC). It measures the game's glyph (disk, ring, fill and symbol
@@ -82,9 +97,17 @@ Small `__SWITCH__` changes in shared code:
   file-service request on the Switch).
 - `lcs_render_config.cpp`: `Backend=OpenGL`/`Software` accepted (also on PC);
   the backend's display name is "OpenGL" when the GL backend is built; a
-  `[Switch]` section (`ConfirmButton`, `Overclock`); on the Switch internal
-  resolution is clamped to 3x and view distance to 2.
-- `host_font_5x7.hpp`: `+` and `-` glyphs for the panel.
+  `[Switch]` section (`ConfirmButton`, `Triggers`, `SkipIntro`); on the
+  Switch internal resolution is clamped to 3x and view distance to 2, and
+  ZL / ZR follow `Triggers` (d-pad left/right by default).
+- `lcs_key_bindings.hpp`: a trigger keeps its buttons in a vehicle unless it
+  also accelerates or brakes (so ZL / ZR change the radio station).
+- `lcs_profile.cpp`: Skip intro presses Cross and Start on alternate pad reads
+  while a video is decoding in the first three minutes. With the GPU
+  presenting directly, a frame the game drew itself (no GE frame for a few
+  vblanks, as on the loading screens) is read from the buffer it displays,
+  not from the last GE target, whose memory the GPU never wrote.
+- `host_font_5x7.hpp`: `+ - : / % ( ) , ' ! ? & < >` glyphs for the panel.
 - Top-level `CMakeLists.txt`: GNU C++ dialect (newlib hides `setenv`/`dup2`
   in strict mode); the recompiler tools and tests are not built.
 - `lcs/CMakeLists.txt`: generated units without debug info (`-g0`); the
@@ -94,7 +117,7 @@ Small `__SWITCH__` changes in shared code:
   `PSPRECOMP_AOT_PRODUCTION_FASTPATHS` default to ON for the Switch (they
   only drop debug checks from every guest store and chained call).
 
-## Start-up, threads and clocks
+## Start-up and threads
 
 `__wrap_main` (the libnx entry calls it through `-Wl,--wrap=main`):
 
@@ -108,15 +131,8 @@ Small `__SWITCH__` changes in shared code:
 4. Logs the applet type (applet mode means the Album: little memory), model,
    firmware and memory.
 5. Shows a text screen and exits if `game/EBOOT.ELF` is missing.
-6. Opens sys-clk's service. Once the game has read `LCSNative.ini`,
-   `[Switch] Overclock` (or the panel) asks it for CPU 1785 MHz and memory
-   1600 MHz (`sys:clk` command 8, temporary overrides). An applet hook
-   releases them when the game loses focus (HOME, sleep) and takes them again
-   on return; `atexit` releases them. Without sys-clk nothing happens.
-   `LCS_NX_CPU_BOOST=1` uses the console's own boost mode instead (the GPU
-   drops to 76.8 MHz, so only for the software GE).
-7. Starts the performance watch (below).
-8. Runs the PC `main()` on a thread with a 64 MiB stack (Windows links with
+6. Starts the performance watch (below).
+7. Runs the PC `main()` on a thread with a 64 MiB stack (Windows links with
    `/STACK:67108864`) pinned to core 0, with `--game /switch/LCSNative/game`.
 
 Every other thread goes through `__wrap_pthread_create` and is placed on cores
@@ -189,7 +205,7 @@ Not done: anything on a console. First console run, what to look at:
 
 1. Does it start (homebrew menu through a game, hold R)? If it closes at once,
    send `lcs_log.txt` and `sdmc:/atmosphere/crash_reports/`.
-2. Log lines `[switch] ...` (applet type, sys-clk) and `[gl] ...` (GL version,
+2. Log lines `[switch] ...` (applet type, model, memory) and `[gl] ...` (GL version,
    or why the OpenGL GE fell back to software).
 3. Title screen, menus, a cutscene video, sound.
 4. Driving around: FPS counter (top left), stutter, picture errors (photos

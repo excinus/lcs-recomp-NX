@@ -6,16 +6,6 @@
 # this file, and lcs_samples.bin with the profiler's samples: send all three
 # with any report.
 
-# Never touch the clocks, whatever Settings > Overclock says.
-#LCS_NX_OVERCLOCK=0
-# Clocks asked of sys-clk when Overclock is on.
-#LCS_NX_CPU_MHZ=1785
-#LCS_NX_MEM_MHZ=1600
-
-# The console's own CPU boost (1785 MHz) without sys-clk. It drops the GPU to
-# 76.8 MHz, so use it only with Backend=Software.
-#LCS_NX_CPU_BOOST=1
-
 # The profiler: pauses each thread ~100 times a second to see where it is.
 # The [watch] lines in the log stay without it.
 #LCS_NX_PROFILE=0

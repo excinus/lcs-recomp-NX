@@ -78,6 +78,15 @@ struct DisplaySurfaceDimensions {
 // Extra mip bias from Rendering.TextureLodBias, clamped to -8..8.
 [[nodiscard]] float rendering_texture_lod_bias() noexcept;
 
+// ZL / ZR: Dpad = the d-pad's left and right (weapon, radio station);
+// Drive = brake and accelerate in a vehicle, centre the camera and aim on
+// foot; Shoulders = L and R again.
+enum class SwitchTriggerMode : std::uint8_t { Dpad, Drive, Shoulders };
+
+[[nodiscard]] const char *switch_trigger_mode_name(SwitchTriggerMode mode) noexcept;
+// Writes the ZL/ZR bindings for `mode` into `bindings`.
+void apply_switch_trigger_mode(ControlBindings &bindings, SwitchTriggerMode mode) noexcept;
+
 [[nodiscard]] float view_distance_scale() noexcept;
 
 void lcs_set_view_distance(float value) noexcept;
@@ -86,7 +95,8 @@ void lcs_set_show_fps(bool enabled) noexcept;
 void lcs_set_frame_rate(std::uint32_t frame_rate) noexcept;
 void lcs_set_internal_resolution(InternalResolutionMode mode, std::uint32_t scale) noexcept;
 void lcs_set_nintendo_confirm(bool enabled) noexcept;
-void lcs_set_overclock(bool enabled) noexcept;
+void lcs_set_switch_triggers(SwitchTriggerMode mode) noexcept;
+void lcs_set_skip_intro(bool enabled) noexcept;
 
 [[nodiscard]] PresentationRectangle calculate_presentation_rectangle(
     std::uint32_t client_width, std::uint32_t client_height,
@@ -157,8 +167,10 @@ struct SwitchConfiguration {
     // In menus, A confirms and B goes back, as Nintendo's own games do. Off
     // keeps the PSP's positions: B (where Cross sits) confirms.
     bool nintendo_confirm{true};
-    // Ask sys-clk for higher CPU and memory clocks while the game is in focus.
-    bool overclock{true};
+    // What ZL and ZR do. The PSP had no triggers.
+    SwitchTriggerMode triggers{SwitchTriggerMode::Dpad};
+    // Skip the logo and intro videos at start.
+    bool skip_intro{false};
 };
 
 struct LcsConfiguration {
