@@ -14,6 +14,7 @@
 
 #include <SDL.h>
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -185,6 +186,27 @@ bool run_frame(int frame, const char *out_dir) {
         quad(shown, 400, 150, 470, 260, 0, 0xFFFFFFFFu, 0, 0, 64.0f, 64.0f);
         ge_gpu_backend_accumulate_color_triangles(d, shown);
     }
+    // 8. The packed 0115 path (u8 uv, 5551 colour, s16 position), indexed:
+    //    a green quad at clip x 0.7..0.9, y 0.6..0.9 (screen 408..456, 14..54).
+    {
+        GeGpuDrawDescriptor d = base_draw();
+        const GeGpuHardwareTransform t = hw_identity(false, false);
+        const auto pack = [](float x, float y) {
+            std::array<std::byte, 10> bytes{};
+            const std::uint16_t color = 0x83E0u;  // alpha bit, green 31
+            const auto px = static_cast<std::int16_t>(x * 32768.0f);
+            const auto py = static_cast<std::int16_t>(y * 32768.0f);
+            std::memcpy(bytes.data() + 2, &color, 2);
+            std::memcpy(bytes.data() + 4, &px, 2);
+            std::memcpy(bytes.data() + 6, &py, 2);
+            return bytes;
+        };
+        std::vector<std::byte> packed;
+        for (const auto &corner : {pack(0.7f, 0.6f), pack(0.9f, 0.6f), pack(0.7f, 0.9f), pack(0.9f, 0.9f)})
+            packed.insert(packed.end(), corner.begin(), corner.end());
+        const std::uint32_t indices[] = {0u, 1u, 2u, 2u, 1u, 3u};
+        (void)ge_gpu_backend_accumulate_hardware_packed_0115(d, t, packed, 4u, indices);
+    }
     const bool shown = ge_gpu_backend_finish_color_frame(static_cast<std::uint64_t>(frame));
     // The Vulkan readback lands at the next finish.
     (void)ge_gpu_backend_finish_color_frame(static_cast<std::uint64_t>(frame) + 1u);
@@ -273,6 +295,7 @@ int main(int argc, char **argv) {
         {"cull: culled triangle", 288, 160, 0, 0, 64},
         {"render target top", 435, 170, 255, 128, 0},
         {"render target bottom", 435, 240, 0, 128, 255},
+        {"packed 0115 quad", 432, 34, 0, 255, 0},
     };
     int failures = 0;
     for (const Expect &e : expects) {

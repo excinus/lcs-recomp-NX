@@ -96,7 +96,6 @@ void lcs_set_frame_rate(std::uint32_t frame_rate) noexcept;
 void lcs_set_internal_resolution(InternalResolutionMode mode, std::uint32_t scale) noexcept;
 void lcs_set_nintendo_confirm(bool enabled) noexcept;
 void lcs_set_switch_triggers(SwitchTriggerMode mode) noexcept;
-void lcs_set_skip_intro(bool enabled) noexcept;
 
 [[nodiscard]] PresentationRectangle calculate_presentation_rectangle(
     std::uint32_t client_width, std::uint32_t client_height,
@@ -169,8 +168,6 @@ struct SwitchConfiguration {
     bool nintendo_confirm{true};
     // What ZL and ZR do. The PSP had no triggers.
     SwitchTriggerMode triggers{SwitchTriggerMode::Dpad};
-    // Skip the logo and intro videos at start.
-    bool skip_intro{false};
 };
 
 struct LcsConfiguration {

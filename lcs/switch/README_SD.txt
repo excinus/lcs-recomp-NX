@@ -34,7 +34,7 @@ Change bindings in LCSNative.ini, section [Controls].
 Settings
 --------
 Press both sticks in (L3 + R3) during play: resolution, view distance, frame
-rate, FPS counter, confirm button, ZL / ZR, skip intro. A or the d-pad
+rate, FPS counter, confirm button, ZL / ZR. A or the d-pad
 changes a row, B closes. Changes are saved to LCSNative.ini; resolution
 applies at the next start.
 

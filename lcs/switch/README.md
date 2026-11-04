@@ -67,7 +67,7 @@ Small `__SWITCH__` changes in shared code:
   `[Switch] ConfirmButton=A`.
 - `lcs_display_menu.cpp`: the panel is a row table. The Switch rows are
   resolution (1x-3x only), view distance (1-2), frame rate, FPS counter,
-  confirm button, ZL / ZR and skip intro; the PC keeps its five rows. The ini
+  confirm button and ZL / ZR; the PC keeps its five rows. The ini
   is read in full and closed before it is written again (Horizon refuses to
   open a file for writing while another handle has it open, which is why the
   first builds lost every change).
@@ -97,16 +97,22 @@ Small `__SWITCH__` changes in shared code:
   file-service request on the Switch).
 - `lcs_render_config.cpp`: `Backend=OpenGL`/`Software` accepted (also on PC);
   the backend's display name is "OpenGL" when the GL backend is built; a
-  `[Switch]` section (`ConfirmButton`, `Triggers`, `SkipIntro`); on the
+  `[Switch]` section (`ConfirmButton`, `Triggers`); on the
   Switch internal resolution is clamped to 3x and view distance to 2, and
   ZL / ZR follow `Triggers` (d-pad left/right by default).
 - `lcs_key_bindings.hpp`: a trigger keeps its buttons in a vehicle unless it
   also accelerates or brakes (so ZL / ZR change the radio station).
-- `lcs_profile.cpp`: Skip intro presses Cross and Start on alternate pad reads
-  while a video is decoding in the first three minutes. With the GPU
-  presenting directly, a frame the game drew itself (no GE frame for a few
-  vblanks, as on the loading screens) is read from the buffer it displays,
-  not from the last GE target, whose memory the GPU never wrote.
+- `lcs_profile.cpp`: frames are shown when the game waits for vblank. Between
+  islands it draws the "Welcome to..." card and then loads for seconds without
+  waiting, so the window kept the last street frame; file reads now present
+  what was drawn or flipped once 300 ms pass without a vblank wait. With the
+  GPU presenting directly, a frame the game drew itself (no GE frame) is read
+  from the buffer it displays, not from the last GE target, whose memory the
+  GPU never wrote.
+- `ge_gpu_backend_gl.cpp`: the packed 0115 vertices go straight into the
+  upload buffer.
+- Audio: the sound queue is 12 blocks (139 ms) instead of 6, so slow frames do
+  not drain it.
 - `host_font_5x7.hpp`: `+ - : / % ( ) , ' ! ? & < >` glyphs for the panel.
 - Top-level `CMakeLists.txt`: GNU C++ dialect (newlib hides `setenv`/`dup2`
   in strict mode); the recompiler tools and tests are not built.

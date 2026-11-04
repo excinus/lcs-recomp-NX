@@ -59,12 +59,11 @@ enum class Row {
     FrameRate,
     ConfirmButton,
     Triggers,
-    SkipIntro,
 };
 
 #if defined(__SWITCH__)
 constexpr Row kRows[] = {Row::Resolution, Row::ViewDistance, Row::FrameRate, Row::FpsCounter,
-                         Row::ConfirmButton, Row::Triggers, Row::SkipIntro};
+                         Row::ConfirmButton, Row::Triggers};
 constexpr SwitchTriggerMode kTriggerModes[] = {SwitchTriggerMode::Dpad, SwitchTriggerMode::Drive,
                                                SwitchTriggerMode::Shoulders};
 #else
@@ -238,7 +237,6 @@ void save_settings() {
 #if defined(__SWITCH__)
     upsert_ini_line(file, "switch", "ConfirmButton", config.nx.nintendo_confirm ? "A" : "B");
     upsert_ini_line(file, "switch", "Triggers", switch_trigger_mode_name(config.nx.triggers));
-    upsert_ini_line(file, "switch", "SkipIntro", config.nx.skip_intro ? "true" : "false");
 #else
     upsert_ini_line(file, "display", "Fullscreen", config.display.fullscreen ? "true" : "false");
 #endif
@@ -308,9 +306,6 @@ void change_selected(int direction) noexcept {
 #endif
         break;
     }
-    case Row::SkipIntro:
-        lcs_set_skip_intro(!lcs_render_configuration().nx.skip_intro);
-        break;
     }
     save_settings();
 }
@@ -349,9 +344,6 @@ void format_row(Row row, char *text, std::size_t size, bool resolution_pending) 
         std::snprintf(text, size, "ZL / ZR         %s", label);
         break;
     }
-    case Row::SkipIntro:
-        std::snprintf(text, size, "Skip intro      %s", config.nx.skip_intro ? "On" : "Off");
-        break;
     }
 }
 

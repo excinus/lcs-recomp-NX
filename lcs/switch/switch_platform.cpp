@@ -236,6 +236,10 @@ void set_default_env() {
     setenv("PSPRECOMP_GE_DECODE_THREADS", "1", 0);
     // Mesa: skip per-call GL error checks.
     setenv("MESA_NO_ERROR", "1", 0);
+    // Sound is mixed as the game's time advances, once per vblank wait. A slow
+    // frame (125 ms at 8 fps) outlasted the PC's 69 ms queue and the sound
+    // broke up; 12 blocks of 512 frames is 139 ms.
+    setenv("PSPRECOMP_AUDIO_PREBUFFER_BLOCKS", "12", 0);
 }
 
 bool env_enabled(const char *name, bool fallback) {

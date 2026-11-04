@@ -15,6 +15,10 @@
 #PSPRECOMP_RASTER_THREADS=2
 #PSPRECOMP_GE_DECODE_THREADS=1
 
+# Sound queue in blocks of 512 samples (11.6 ms each), 2 to 22. More holds
+# through slow frames, at the cost of sound lagging the picture a little.
+#PSPRECOMP_AUDIO_PREBUFFER_BLOCKS=12
+
 # No sound (to rule the audio path out when something hangs).
 #PSPRECOMP_AUDIO=0
 

@@ -948,12 +948,6 @@ UploadVertex make_upload_vertex(const GeGpuVertex &source) noexcept {
             source.fog_factor, source.q};
 }
 
-float expand5(std::uint32_t value) noexcept {
-    value &= 31u;
-    const std::uint32_t expanded = (value << 3u) | (value >> 2u);
-    return static_cast<float>(expanded) * (1.0f / 255.0f);
-}
-
 UploadVertex decode_packed(const Packed0115 &packed) noexcept {
     UploadVertex vertex{};
     vertex.x = static_cast<float>(packed.x) * (1.0f / 32768.0f);
@@ -963,9 +957,11 @@ UploadVertex decode_packed(const Packed0115 &packed) noexcept {
     vertex.u = static_cast<float>(packed.u) * (1.0f / 128.0f);
     vertex.v = static_cast<float>(packed.v) * (1.0f / 128.0f);
     vertex.q = 1.0f;
-    const std::uint32_t r = static_cast<std::uint32_t>(std::lround(expand5(packed.color) * 255.0f));
-    const std::uint32_t g = static_cast<std::uint32_t>(std::lround(expand5(packed.color >> 5u) * 255.0f));
-    const std::uint32_t b = static_cast<std::uint32_t>(std::lround(expand5(packed.color >> 10u) * 255.0f));
+    // 5 to 8 bits: the top bits repeat into the low ones (31 -> 255).
+    const auto widen = [](std::uint32_t value) { value &= 31u; return (value << 3u) | (value >> 2u); };
+    const std::uint32_t r = widen(packed.color);
+    const std::uint32_t g = widen(packed.color >> 5u);
+    const std::uint32_t b = widen(packed.color >> 10u);
     const std::uint32_t a = (packed.color & 0x8000u) != 0u ? 255u : 0u;
     vertex.rgba = r | (g << 8u) | (b << 16u) | (a << 24u);
     return vertex;
@@ -1738,28 +1734,34 @@ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
     else if (draw.texture_enabled) ++s.report.game_textured_draws_without_texture;
 }
 
-void ge_gpu_backend_accumulate_hardware_triangles(
-    const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
-    std::span<const GeGpuVertex> vertices, std::span<const std::uint32_t> triangle_indices) noexcept {
+namespace {
+
+// One hardware-transformed draw: `vertex_count` vertices that `append` adds to
+// s.vertices, drawn through `triangle_indices` (or in order when empty).
+template <class Append>
+void accumulate_hardware_draw(const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
+                              std::size_t vertex_count, Append &&append,
+                              std::span<const std::uint32_t> triangle_indices) noexcept {
     GlState &s = state();
     std::lock_guard<std::recursive_mutex> guard(s.mutex);
-    if (!s.enabled || vertices.empty()) return;
+    if (!s.enabled || vertex_count == 0u) return;
     const bool indexed = !triangle_indices.empty();
-    const std::size_t emitted = indexed ? triangle_indices.size() : vertices.size();
+    const std::size_t emitted = indexed ? triangle_indices.size() : vertex_count;
     if (emitted == 0u || (transform.primitive == 4u ? emitted < 3u : (emitted % 3u) != 0u)) return;
-    const std::size_t append = indexed ? vertices.size() : emitted;
+    const std::size_t appended = indexed ? vertex_count : emitted;
     const std::size_t extra_indices = indexed ? triangle_indices.size() : 0u;
     const std::size_t used = s.vertices.size() * sizeof(UploadVertex) + s.indices.size() * sizeof(std::uint32_t);
-    if (used + append * sizeof(UploadVertex) + extra_indices * sizeof(std::uint32_t) > kGeometryUploadCapacity) {
+    if (used + appended * sizeof(UploadVertex) + extra_indices * sizeof(std::uint32_t) > kGeometryUploadCapacity) {
         ++s.report.game_vertex_overflows;
         return;
     }
     const std::uint32_t first_vertex = static_cast<std::uint32_t>(s.vertices.size());
     const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
-    for (const GeGpuVertex &source : vertices) s.vertices.push_back(make_upload_vertex(source));
+    s.vertices.resize(first_vertex + vertex_count);
+    append(s.vertices.data() + first_vertex);
     if (indexed) {
         for (std::uint32_t index : triangle_indices) {
-            if (index >= vertices.size()) {
+            if (index >= vertex_count) {
                 s.vertices.resize(first_vertex);
                 s.indices.resize(first_index);
                 ++s.report.game_vertex_overflows;
@@ -1772,7 +1774,7 @@ void ge_gpu_backend_accumulate_hardware_triangles(
     Batch batch{};
     batch.draw = draw;
     batch.first_vertex = first_vertex;
-    batch.vertex_count = static_cast<std::uint32_t>(append);
+    batch.vertex_count = static_cast<std::uint32_t>(appended);
     batch.first_index = first_index;
     batch.index_count = indexed ? static_cast<std::uint32_t>(triangle_indices.size()) : 0u;
     batch.indexed = indexed;
@@ -1787,10 +1789,20 @@ void ge_gpu_backend_accumulate_hardware_triangles(
         ? (emitted > 2u ? emitted - 2u : 0u) : emitted / 3u;
     s.report.game_vertices += emitted;
     s.report.hw_transform_draw_calls += logical;
-    s.report.hw_transform_vertices += vertices.size();
+    s.report.hw_transform_vertices += vertex_count;
     const bool sampled = draw.texture_enabled && ge_gpu_backend_texture_available(draw);
     if (draw.texture_enabled && sampled) s.report.textured_game_draw_calls += logical;
     else if (draw.texture_enabled) s.report.game_textured_draws_without_texture += logical;
+}
+
+}  // namespace
+
+void ge_gpu_backend_accumulate_hardware_triangles(
+    const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
+    std::span<const GeGpuVertex> vertices, std::span<const std::uint32_t> triangle_indices) noexcept {
+    accumulate_hardware_draw(draw, transform, vertices.size(), [&](UploadVertex *out) {
+        for (const GeGpuVertex &source : vertices) *out++ = make_upload_vertex(source);
+    }, triangle_indices);
 }
 
 bool ge_gpu_backend_accumulate_hardware_packed_0115(
@@ -1802,27 +1814,15 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
     if (!s.enabled || vertex_count == 0u ||
         packed_vertices.size() != static_cast<std::size_t>(vertex_count) * sizeof(Packed0115))
         return false;
-    // Reused between draws: a fresh vector per draw was a heap round trip each time.
-    static thread_local std::vector<GeGpuVertex> decoded;
-    decoded.resize(vertex_count);
-    for (std::uint32_t index = 0u; index < vertex_count; ++index) {
-        Packed0115 packed{};
-        std::memcpy(&packed, packed_vertices.data() + static_cast<std::size_t>(index) * sizeof(Packed0115),
-                    sizeof(Packed0115));
-        const UploadVertex upload = decode_packed(packed);
-        GeGpuVertex vertex{};
-        vertex.x = upload.x;
-        vertex.y = upload.y;
-        vertex.z = upload.z;
-        vertex.w = upload.w;
-        vertex.rgba = upload.rgba;
-        vertex.u = upload.u;
-        vertex.v = upload.v;
-        vertex.q = upload.q;
-        vertex.fog_factor = upload.fog_factor;
-        decoded[index] = vertex;
-    }
-    ge_gpu_backend_accumulate_hardware_triangles(draw, transform, decoded, triangle_indices);
+    // Straight into the upload buffer (decode_packed gives the upload layout).
+    accumulate_hardware_draw(draw, transform, vertex_count, [&](UploadVertex *out) {
+        const std::byte *source = packed_vertices.data();
+        for (std::uint32_t index = 0u; index < vertex_count; ++index) {
+            Packed0115 packed{};
+            std::memcpy(&packed, source + static_cast<std::size_t>(index) * sizeof(Packed0115), sizeof(Packed0115));
+            out[index] = decode_packed(packed);
+        }
+    }, triangle_indices);
     return true;
 }
 

@@ -437,13 +437,8 @@ void apply_switch_key(LcsConfiguration &config, const std::string &key,
         else warning(config, line, "Switch.Triggers expects Dpad, Drive or Shoulders");
         return;
     }
-    if (key == "skipintro") {
-        if (!parse_bool(value, config.nx.skip_intro))
-            warning(config, line, "Switch.SkipIntro expects true/false");
-        return;
-    }
-    // Earlier builds asked sys-clk for clocks; that is now left to the player.
-    if (key == "overclock") return;
+    // Keys of earlier test builds (sys-clk clocks, intro skipping): ignored.
+    if (key == "overclock" || key == "skipintro") return;
     warning(config, line, "unknown [Switch] key '" + key + "'");
 }
 
@@ -620,11 +615,6 @@ void lcs_set_switch_triggers(SwitchTriggerMode mode) noexcept {
     LcsConfiguration &config = global_configuration();
     config.nx.triggers = mode;
     apply_switch_trigger_mode(config.controls.bindings, mode);
-}
-
-void lcs_set_skip_intro(bool enabled) noexcept {
-    std::lock_guard<std::mutex> guard(global_configuration_mutex());
-    global_configuration().nx.skip_intro = enabled;
 }
 
 void lcs_set_frame_rate(std::uint32_t frame_rate) noexcept {

@@ -1154,27 +1154,6 @@ std::unordered_map<std::int32_t, std::deque<PendingGeCallback>> pending_ge_callb
 std::uint64_t virtual_time_us{};
 std::uint64_t umd_stream_flag_last_rearm_us{};
 
-// Settings > Skip intro. The logo and intro videos stop when the player
-// presses a button, so while one plays the game sees short presses of Cross
-// and Start. Only videos in the first minutes count, and only while frames
-// are being decoded: the presses end with the last video.
-std::uint64_t movie_frames_decoded{};
-constexpr std::uint64_t kIntroWindowUs = 180ull * 1000000ull;
-
-std::uint32_t intro_skip_buttons() {
-    static std::uint64_t frames_at_last_read = 0u;
-    static bool pressed_last_read = false;
-    const bool advancing = movie_frames_decoded != frames_at_last_read;
-    frames_at_last_read = movie_frames_decoded;
-    if (!advancing || virtual_time_us > kIntroWindowUs ||
-        !lcs_render_configuration().nx.skip_intro) {
-        pressed_last_read = false;
-        return 0u;
-    }
-    // Press on one read, release on the next: a press is an edge.
-    pressed_last_read = !pressed_last_read;
-    return pressed_last_read ? (0x004000u | 0x000008u) : 0u;  // Cross | Start
-}
 
 constexpr std::uint32_t kGameRenderWidthAddress = 0x08B5698Cu;
 
@@ -1879,6 +1858,9 @@ struct PresentRequest {
     std::uint32_t display_height{};
     std::uint32_t game_width{};
     std::uint32_t game_height{};
+    // Sent from file I/O while the game loads without waiting for vblank:
+    // show what it drew last, even a frame it drew itself.
+    bool stalled{false};
 };
 
 void cap_frame_rate(std::uint32_t list_address) {
@@ -1952,7 +1934,7 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
     bool presented_gpu_frame = false;
     static bool showing_guest_frame = false;
     if (ge_gpu_backend_presents_directly()) {
-        const bool show_guest = !gpu_frame_ready && !holding_gpu_frame &&
+        const bool show_guest = !gpu_frame_ready && (request.stalled || !holding_gpu_frame) &&
                                 ge_gpu_backend_guest_present_available();
         if (!show_guest) {
             ge_gpu_backend_mark_window_presented();
@@ -2005,6 +1987,63 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
                                    present_width, present_height);
         }
     }
+}
+
+PresentRequest make_present_request(const psprecomp::Runtime &rt, bool stalled) {
+    PresentRequest request{};
+    request.vblank = display_vblank_index;
+    request.display_buffer = display_state.frame_buffer;
+    request.display_stride = display_state.buffer_width;
+    request.pixel_format = display_state.pixel_format;
+    request.display_width = display_state.width;
+    request.display_height = display_state.height;
+    if (rt.memory().contains(kGameRenderWidthAddress, 8u)) {
+        request.game_width = rt.memory().load32(kGameRenderWidthAddress);
+        request.game_height = rt.memory().load32(kGameRenderWidthAddress + 4u);
+    }
+    request.stalled = stalled;
+    return request;
+}
+
+// What the window last got, for present_if_stalled.
+std::chrono::steady_clock::time_point last_present_wall{};
+std::uint32_t last_present_framebuffer{};
+std::uint64_t ge_lists_since_present{};
+
+void submit_present(psprecomp::Runtime &rt, const PresentRequest &request) {
+    last_present_wall = std::chrono::steady_clock::now();
+    last_present_framebuffer = request.display_buffer;
+    ge_lists_since_present = 0u;
+    if (!ge_async_enabled()) {
+        present_frame(rt, request);
+    } else if (ge_worker.pending_presents.load() == 0u) {
+        ge_worker.pending_presents.fetch_add(1u);
+        ge_worker_submit([&rt, request] {
+            present_frame(rt, request);
+            ge_worker.pending_presents.fetch_sub(1u);
+        });
+    }
+}
+
+// The game shows frames only when it waits for vblank. Between islands it
+// draws the "Welcome to..." card, sets it as the display buffer and then
+// loads for a few seconds without waiting for vblank; a PSP's display shows
+// the card all along, the window kept the last street frame. File reads call
+// this: once the game has gone 300 ms without a vblank wait (longer than any
+// slow frame, so a frame still being drawn is not shown) and has drawn or
+// flipped since the last present, that picture is presented.
+void present_if_stalled(psprecomp::Runtime &rt) {
+    if (last_present_wall.time_since_epoch().count() == 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_present_wall < std::chrono::milliseconds(300)) return;
+    if (ge_lists_since_present == 0u && display_state.frame_buffer == last_present_framebuffer) return;
+    static std::uint64_t logged = 0u;
+    if (logged++ < 20u)
+        std::cout << "[present] loading without vblank: showing frame 0x" << std::hex
+                  << display_state.frame_buffer << std::dec << " (" << ge_lists_since_present
+                  << " lists)\n" << std::flush;
+    submit_present(rt, make_present_request(rt, true));
+    display_window_pump();
 }
 
 void check_wall_clock_limit(psprecomp::Runtime &runtime, std::uint64_t sample_mask) {
@@ -3016,6 +3055,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
 
     runtime.register_hle("IoFileMgrForUser", 0x109F50BCu,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            present_if_stalled(rt);
             const std::string path = rt.memory().read_c_string(ctx.gpr[4]);
             // Reject write/create/truncate/append before opening any native path.
             if (stress_test_enabled() && (ctx.gpr[5] & (0x0002u | 0x0100u | 0x0200u | 0x0400u)) != 0u) {
@@ -3087,6 +3127,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
 
     runtime.register_hle("IoFileMgrForUser", 0x6A638D83u,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            present_if_stalled(rt);
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint32_t dst = ctx.gpr[5];
             std::uint32_t size = ctx.gpr[6];
@@ -3165,7 +3206,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         });
 
     runtime.register_hle("IoFileMgrForUser", 0x27EB27B8u,
-        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            present_if_stalled(rt);
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint64_t raw_offset = static_cast<std::uint64_t>(ctx.gpr[6]) |
                 (static_cast<std::uint64_t>(ctx.gpr[7]) << 32u);
@@ -3358,7 +3400,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const HostInputState host = stress_test_enabled()
                 ? stress_test_input(rt, {}) : display_window_input();
-            const std::uint32_t buttons = host.buttons | (stress_test_enabled() ? 0u : intro_skip_buttons());
+            const std::uint32_t buttons = host.buttons;
             for (std::uint32_t index = 0u; index < count; ++index) {
                 const std::uint32_t sample = destination + index * sample_size;
                 rt.memory().store32(sample, static_cast<std::uint32_t>(system_time_microseconds()));
@@ -3419,27 +3461,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     auto wait_vblank = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
         ++display_vblank_index;
         check_wall_clock_limit(rt, 0x3Fu);
-        PresentRequest request{};
-        request.vblank = display_vblank_index;
-        request.display_buffer = display_state.frame_buffer;
-        request.display_stride = display_state.buffer_width;
-        request.pixel_format = display_state.pixel_format;
-        request.display_width = display_state.width;
-        request.display_height = display_state.height;
-        if (rt.memory().contains(kGameRenderWidthAddress, 8u)) {
-            request.game_width = rt.memory().load32(kGameRenderWidthAddress);
-            request.game_height = rt.memory().load32(kGameRenderWidthAddress + 4u);
-        }
-        if (!ge_async_enabled()) {
-            present_frame(rt, request);
-        } else if (ge_worker.pending_presents.load() == 0u) {
-            ge_worker.pending_presents.fetch_add(1u);
-            ge_worker_submit([&rt, request] {
-                present_frame(rt, request);
-                ge_worker.pending_presents.fetch_sub(1u);
-            });
-        }
-
+        submit_present(rt, make_present_request(rt, false));
         display_window_pump();
         if (display_window_closed()) {
             ge_worker_wait_idle();
@@ -3469,6 +3491,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const std::uint32_t list_address = ctx.gpr[4];
             const bool from_vblank = in_vblank_interrupt();
             if (!from_vblank) cap_frame_rate(list_address);
+            ++ge_lists_since_present;
             bool list_finished = false;
             std::uint32_t finish_argument = 0u;
             if (from_vblank) {
@@ -4502,7 +4525,6 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     std::span<const std::uint8_t>(frame.data() + y * source_stride, source_stride));
             }
             rt.memory().store32(status_pointer, 1u);
-            ++movie_frames_decoded;
             set_success(ctx);
         });
 
