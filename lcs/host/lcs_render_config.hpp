@@ -85,6 +85,8 @@ void lcs_set_fullscreen_setting(bool enabled) noexcept;
 void lcs_set_show_fps(bool enabled) noexcept;
 void lcs_set_frame_rate(std::uint32_t frame_rate) noexcept;
 void lcs_set_internal_resolution(InternalResolutionMode mode, std::uint32_t scale) noexcept;
+void lcs_set_nintendo_confirm(bool enabled) noexcept;
+void lcs_set_overclock(bool enabled) noexcept;
 
 [[nodiscard]] PresentationRectangle calculate_presentation_rectangle(
     std::uint32_t client_width, std::uint32_t client_height,
@@ -150,8 +152,18 @@ struct ControlsConfiguration {
     ControlBindings bindings{default_control_bindings()};
 };
 
+// [Switch] section. Read on every platform; only the Switch build acts on it.
+struct SwitchConfiguration {
+    // In menus, A confirms and B goes back, as Nintendo's own games do. Off
+    // keeps the PSP's positions: B (where Cross sits) confirms.
+    bool nintendo_confirm{true};
+    // Ask sys-clk for higher CPU and memory clocks while the game is in focus.
+    bool overclock{true};
+};
+
 struct LcsConfiguration {
     ControlsConfiguration controls{};
+    SwitchConfiguration nx{};
     DisplayConfiguration display{};
     RenderingConfiguration rendering{};
     AudioConfiguration audio{};

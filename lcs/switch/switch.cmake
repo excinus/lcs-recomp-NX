@@ -21,6 +21,8 @@ pkg_check_modules(NX_SDL2 REQUIRED IMPORTED_TARGET sdl2)
 
 target_sources(lcs_host PRIVATE
     ${LCS_SWITCH_DIR}/switch_platform.cpp)
+set_source_files_properties(${LCS_SWITCH_DIR}/switch_platform.cpp PROPERTIES
+    COMPILE_DEFINITIONS "LCS_SWITCH_VERSION_STRING=\"${LCS_SWITCH_VERSION}\"")
 if(LCS_SWITCH_OPENGL AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/host/ge_gpu_backend_gl.cpp)
     # GL entry points come through SDL_GL_GetProcAddress; SDL2's own link line
     # already brings Mesa (-lEGL -lglapi -ldrm_nouveau). Mesa's .pc files here

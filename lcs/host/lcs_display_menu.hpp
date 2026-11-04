@@ -14,10 +14,15 @@ enum class HostSettingsKey {
     Close,
 };
 
+inline constexpr int kHostSettingsMaxRows = 8;
+
 struct HostSettingsView {
     int selected{0};
-    char rows[5][48]{};
+    int row_count{5};
+    char rows[kHostSettingsMaxRows][48]{};
     bool resolution_pending{false};
+    const char *title{"HOST SETTINGS"};
+    const char *hint{"F10 CLOSE"};
 };
 
 [[nodiscard]] bool host_settings_open() noexcept;

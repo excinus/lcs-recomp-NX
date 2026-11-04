@@ -16,6 +16,11 @@ namespace lcs {
 void prompt_texture_apply(std::uint64_t signature, std::uint32_t width, std::uint32_t height,
                           std::uint32_t mip_levels, std::span<std::byte> rgba8);
 
+// Changes when the picture prompt_texture_apply would paint for this texture
+// changes (the "switch" style's menu chips follow Switch.ConfirmButton), so a
+// renderer can drop a cached copy. 0 for textures that are never repainted.
+[[nodiscard]] std::uint32_t prompt_texture_variant(std::uint64_t signature);
+
 // Writes the first seen picture of every texture to the dump folder so the
 // button prompt atlas can be identified offline. `screen_space` marks draws
 // that use through (2D) vertices, which is where the HUD lives.

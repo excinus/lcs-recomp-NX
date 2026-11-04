@@ -37,7 +37,9 @@ APP_DIR="$STAGE_DIR/switch/LCSNative"
 rm -rf "$STAGE_DIR"
 mkdir -p "$APP_DIR/game"
 cp "$NRO" "$APP_DIR/LCSNative.nro"
-cp "$ROOT/lcs/switch/LCSNative.ini" "$APP_DIR/LCSNative.ini"
+# The game makes LCSNative.ini from this on first start, so an update never
+# overwrites the player's settings.
+cp "$ROOT/lcs/switch/LCSNative.ini" "$APP_DIR/LCSNative.default.ini"
 cp "$ROOT/lcs/switch/lcs_env.txt" "$APP_DIR/lcs_env.txt"
 cp "$ROOT/lcs/switch/game_README.txt" "$APP_DIR/game/README.txt"
 cp "$ROOT/lcs/switch/README_SD.txt" "$APP_DIR/README.txt"

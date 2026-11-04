@@ -22,6 +22,7 @@
 #if defined(LCS_GL_GE_BACKEND)
 
 #include "lcs_display_menu.hpp"
+#include "lcs_prompt_textures.hpp"
 #include "lcs_render_config.hpp"
 #include "lcs_runtime_log.hpp"
 
@@ -242,6 +243,7 @@ struct Texture {
     bool dirty{};
     std::uint64_t signature_epoch{};
     std::uint64_t last_used_epoch{};
+    std::uint32_t prompt_variant{};
 };
 
 // What a batch draws with, decided before any GL call of the frame so all the
@@ -929,6 +931,7 @@ bool prepare_texture(GlState &s, const GeGpuDrawDescriptor &draw, std::uint32_t 
     texture.dirty = true;
     texture.signature_epoch = s.frame_epoch;
     texture.last_used_epoch = s.frame_epoch;
+    texture.prompt_variant = prompt_texture_variant(draw.texture_content_signature);
     s.last_texture_rgba = texture.rgba8;
     if (draw.texture_format <= 10u) s.report.base_texture_formats_active = true;
     ++s.report.decoded_texture_uploads;
@@ -1583,6 +1586,10 @@ bool ge_gpu_backend_texture_needed(const GeGpuDrawDescriptor &draw) noexcept {
     found->second.last_used_epoch = s.frame_epoch;
     if (draw.texture_content_signature != 0u &&
         found->second.descriptor.texture_content_signature != draw.texture_content_signature)
+        return true;
+    // A repainted button prompt whose picture changed with a setting.
+    if (draw.texture_content_signature != 0u &&
+        found->second.prompt_variant != prompt_texture_variant(draw.texture_content_signature))
         return true;
     ++s.report.texture_cache_hits;
     return false;

@@ -105,6 +105,56 @@ bool key_down(SDL_Scancode scancode) noexcept {
     return keys != nullptr && keys[scancode] != 0;
 }
 
+#if defined(__SWITCH__)
+// Every connected controller drives the game: handheld, detached Joy-Cons, a
+// Pro Controller, whichever the player picks up.
+constexpr int kMaxPads = 8;
+SDL_GameController *g_pads[kMaxPads]{};
+
+void close_pad(SDL_JoystickID instance = -1) noexcept {
+    for (SDL_GameController *&pad : g_pads) {
+        if (pad == nullptr) continue;
+        if (instance >= 0 && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad)) != instance)
+            continue;
+        SDL_GameControllerClose(pad);
+        pad = nullptr;
+    }
+    g_pad = nullptr;
+    for (SDL_GameController *pad : g_pads)
+        if (pad != nullptr && g_pad == nullptr) g_pad = pad;
+}
+
+void open_pad(int device_index) noexcept {
+    if (!SDL_IsGameController(device_index)) return;
+    const SDL_JoystickID instance = SDL_JoystickGetDeviceInstanceID(device_index);
+    for (SDL_GameController *pad : g_pads)
+        if (pad != nullptr && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad)) == instance)
+            return;
+    for (SDL_GameController *&pad : g_pads) {
+        if (pad != nullptr) continue;
+        pad = SDL_GameControllerOpen(device_index);
+        if (g_pad == nullptr) g_pad = pad;
+        return;
+    }
+}
+
+bool pad_button(SDL_GameControllerButton id) noexcept {
+    for (SDL_GameController *pad : g_pads)
+        if (pad != nullptr && SDL_GameControllerGetButton(pad, id) != 0) return true;
+    return false;
+}
+
+// The largest deflection among the controllers.
+Sint16 pad_axis(SDL_GameControllerAxis id) noexcept {
+    Sint16 best = 0;
+    for (SDL_GameController *pad : g_pads) {
+        if (pad == nullptr) continue;
+        const Sint16 value = SDL_GameControllerGetAxis(pad, id);
+        if (std::abs(static_cast<int>(value)) > std::abs(static_cast<int>(best))) best = value;
+    }
+    return best;
+}
+#else
 void close_pad() noexcept {
     if (g_pad == nullptr) return;
     SDL_GameControllerClose(g_pad);
@@ -115,6 +165,15 @@ void open_pad(int device_index) noexcept {
     if (g_pad != nullptr || !SDL_IsGameController(device_index)) return;
     g_pad = SDL_GameControllerOpen(device_index);
 }
+
+bool pad_button(SDL_GameControllerButton id) noexcept {
+    return g_pad != nullptr && SDL_GameControllerGetButton(g_pad, id) != 0;
+}
+
+Sint16 pad_axis(SDL_GameControllerAxis id) noexcept {
+    return g_pad != nullptr ? SDL_GameControllerGetAxis(g_pad, id) : Sint16{0};
+}
+#endif
 
 void apply_window_fullscreen(bool enabled) noexcept {
     if (g_window == nullptr) return;
@@ -141,22 +200,27 @@ void apply_fullscreen_request() noexcept {
 }
 
 #if defined(__SWITCH__)
-// No keyboard on a Switch: + and - together open and close the host settings,
-// the d-pad moves through them and B (SDL's south button) closes them.
-void handle_switch_pad_button(std::uint8_t button) noexcept {
-    if (g_pad == nullptr) return;
-    const auto held = [](SDL_GameControllerButton id) {
-        return SDL_GameControllerGetButton(g_pad, id) != 0;
-    };
-    const bool combo =
-        (button == SDL_CONTROLLER_BUTTON_START && held(SDL_CONTROLLER_BUTTON_BACK)) ||
-        (button == SDL_CONTROLLER_BUTTON_BACK && held(SDL_CONTROLLER_BUTTON_START));
-    if (combo) {
+// No keyboard on a Switch. Both sticks pressed in (L3 + R3) open and close the
+// settings panel; neither click reaches the game while both are held. In the
+// panel the d-pad moves and B closes.
+bool g_stick_combo_held = false;
+
+void poll_switch_settings_combo() noexcept {
+    const bool both = pad_button(SDL_CONTROLLER_BUTTON_LEFTSTICK) &&
+                      pad_button(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+    if (both && !g_stick_combo_held) {
         const bool was_open = host_settings_open();
         host_settings_handle(HostSettingsKey::Toggle);
         if (was_open) discard_pending_pointer();
-        return;
     }
+    // Stays set until both are released, so the clicks do not leak afterwards.
+    if (both) g_stick_combo_held = true;
+    else if (!pad_button(SDL_CONTROLLER_BUTTON_LEFTSTICK) &&
+             !pad_button(SDL_CONTROLLER_BUTTON_RIGHTSTICK))
+        g_stick_combo_held = false;
+}
+
+void handle_switch_pad_button(std::uint8_t button) noexcept {
     if (!host_settings_open()) return;
     switch (button) {
     case SDL_CONTROLLER_BUTTON_DPAD_UP: host_settings_handle(HostSettingsKey::Up); break;
@@ -209,8 +273,13 @@ void pump_events() noexcept {
 #endif
         } else if (event.type == SDL_CONTROLLERDEVICEADDED)
             open_pad(event.cdevice.which);
+#if defined(__SWITCH__)
+        else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
+            close_pad(event.cdevice.which);
+#else
         else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
             close_pad();
+#endif
         else if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
             g_focused = true;
         else if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
@@ -218,6 +287,9 @@ void pump_events() noexcept {
         else if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE)
             g_closed = true;
     }
+#if defined(__SWITCH__)
+    poll_switch_settings_combo();
+#endif
 }
 
 std::uint32_t unpack_pixel(const std::uint8_t *src, std::uint32_t format) {
@@ -327,13 +399,9 @@ void paint_host_settings(SDL_Renderer *renderer) noexcept {
     SDL_SetRenderDrawColor(renderer, 8, 12, 28, 230);
     fill_rect(renderer, origin_x, origin_y, panel_w, panel_h);
     SDL_SetRenderDrawColor(renderer, 180, 200, 230, 255);
-    draw_text(renderer, origin_x + 8 * scale, origin_y + 6 * scale, scale, "HOST SETTINGS");
-#if defined(__SWITCH__)
-    draw_text(renderer, origin_x + 8 * scale, origin_y + 16 * scale, scale, "PLUS MINUS OR B CLOSE");
-#else
-    draw_text(renderer, origin_x + 8 * scale, origin_y + 16 * scale, scale, "F10 CLOSE");
-#endif
-    for (int row = 0; row < 5; ++row) {
+    draw_text(renderer, origin_x + 8 * scale, origin_y + 6 * scale, scale, view.title);
+    draw_text(renderer, origin_x + 8 * scale, origin_y + 16 * scale, scale, view.hint);
+    for (int row = 0; row < std::clamp(view.row_count, 0, kHostSettingsMaxRows); ++row) {
         const int y = origin_y + (28 + row * 12) * scale;
         if (row == view.selected) {
             SDL_SetRenderDrawColor(renderer, 40, 70, 120, 255);
@@ -346,8 +414,9 @@ void paint_host_settings(SDL_Renderer *renderer) noexcept {
     }
     if (view.resolution_pending) {
         SDL_SetRenderDrawColor(renderer, 220, 180, 80, 255);
-        draw_text(renderer, origin_x + 8 * scale, origin_y + (28 + 5 * 12) * scale, scale,
-                  "RESTART TO APPLY");
+        draw_text(renderer, origin_x + 8 * scale,
+                  origin_y + (28 + std::clamp(view.row_count, 0, kHostSettingsMaxRows) * 12) * scale,
+                  scale, "RESTART TO APPLY");
     }
 }
 
@@ -511,7 +580,9 @@ void display_window_init() {
 #endif
     for (int index = 0; index < SDL_NumJoysticks(); ++index) {
         open_pad(index);
+#if !defined(__SWITCH__)
         if (g_pad != nullptr) break;
+#endif
     }
     ge_gpu_backend_set_native_window(g_window);
 }
@@ -525,7 +596,11 @@ void display_window_attach_gpu_backend() {
         int height = 0;
         SDL_GetWindowSize(g_window, &width, &height);
         std::cerr << "[window] shown " << width << "x" << height
-                  << " presenter=vulkan  F10 host settings\n";
+#if defined(__SWITCH__)
+                  << " presenter=gpu  L3+R3 settings\n";
+#else
+                  << " presenter=gpu  F10 host settings\n";
+#endif
         return;
     }
     create_software_renderer();
@@ -702,16 +777,22 @@ HostInputState display_window_input() {
     }
     if (!focused || g_pad == nullptr) return publish();
 
+#if defined(__SWITCH__)
+    // Nintendo layout in menus: A (the right button) confirms and B goes back.
+    // The game's menus confirm with Cross, the bottom button, so the two trade
+    // places while a menu is up. Gameplay keeps the PSP positions.
+    const bool swap_confirm = menu && lcs_render_configuration().nx.nintendo_confirm;
+    const bool stick_combo = g_stick_combo_held;
+#else
+    constexpr bool swap_confirm = false;
+    constexpr bool stick_combo = false;
+#endif
     const auto pad_down = [&](PadButton button) {
-        const auto held = [&](SDL_GameControllerButton id) {
-            return SDL_GameControllerGetButton(g_pad, id) != 0;
-        };
-        const auto axis = [&](SDL_GameControllerAxis id) {
-            return SDL_GameControllerGetAxis(g_pad, id);
-        };
+        const auto held = [&](SDL_GameControllerButton id) { return pad_button(id); };
+        const auto axis = [&](SDL_GameControllerAxis id) { return pad_axis(id); };
         switch (button) {
-        case PadButton::A: return held(SDL_CONTROLLER_BUTTON_A);
-        case PadButton::B: return held(SDL_CONTROLLER_BUTTON_B);
+        case PadButton::A: return held(swap_confirm ? SDL_CONTROLLER_BUTTON_B : SDL_CONTROLLER_BUTTON_A);
+        case PadButton::B: return held(swap_confirm ? SDL_CONTROLLER_BUTTON_A : SDL_CONTROLLER_BUTTON_B);
         case PadButton::X: return held(SDL_CONTROLLER_BUTTON_X);
         case PadButton::Y: return held(SDL_CONTROLLER_BUTTON_Y);
         case PadButton::LeftShoulder: return held(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
@@ -722,8 +803,8 @@ HostInputState display_window_input() {
         case PadButton::DpadDown: return held(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
         case PadButton::DpadLeft: return held(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
         case PadButton::DpadRight: return held(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
-        case PadButton::LeftClick: return held(SDL_CONTROLLER_BUTTON_LEFTSTICK);
-        case PadButton::RightClick: return held(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+        case PadButton::LeftClick: return !stick_combo && held(SDL_CONTROLLER_BUTTON_LEFTSTICK);
+        case PadButton::RightClick: return !stick_combo && held(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
         case PadButton::LeftTrigger: return axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 8192;
         case PadButton::RightTrigger: return axis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8192;
         case PadButton::Count: return false;
@@ -737,7 +818,7 @@ HostInputState display_window_input() {
     const auto apply_stick = [&](SDL_GameControllerAxis x_axis, SDL_GameControllerAxis y_axis,
                                  StickRole role) {
         const StickReading reading = interpret_stick(
-            role, SDL_GameControllerGetAxis(g_pad, x_axis), SDL_GameControllerGetAxis(g_pad, y_axis),
+            role, pad_axis(x_axis), pad_axis(y_axis),
             false, controls.invert_camera_y);
         if (reading.move) {
             input.analog_x = reading.move_x;

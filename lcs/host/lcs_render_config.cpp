@@ -1,4 +1,5 @@
 #include "lcs_render_config.hpp"
+#include "lcs_switch_hooks.hpp"
 #include "lcs_widescreen.hpp"
 
 #include <algorithm>
@@ -419,6 +420,23 @@ void apply_widescreen_key(LcsConfiguration &config, const std::string &key,
     warning(config, line, "unknown [Widescreen] key '" + key + "'");
 }
 
+void apply_switch_key(LcsConfiguration &config, const std::string &key,
+                      const std::string &value, std::size_t line) {
+    if (key == "confirmbutton" || key == "menuconfirm") {
+        const std::string button = lowercase_copy(trim_copy(value));
+        if (button == "a" || button == "nintendo") config.nx.nintendo_confirm = true;
+        else if (button == "b" || button == "playstation" || button == "psp") config.nx.nintendo_confirm = false;
+        else warning(config, line, "Switch.ConfirmButton expects A or B");
+        return;
+    }
+    if (key == "overclock") {
+        if (!parse_bool(value, config.nx.overclock))
+            warning(config, line, "Switch.Overclock expects true/false");
+        return;
+    }
+    warning(config, line, "unknown [Switch] key '" + key + "'");
+}
+
 void apply_timing_key(LcsConfiguration &config, const std::string &key,
                       const std::string &value, std::size_t line) {
     if (key == "framerate" || key == "fps" || key == "targetfps") {
@@ -521,15 +539,21 @@ float rendering_texture_lod_bias() noexcept {
     return std::clamp(bias, -8.0f, 8.0f);
 }
 
+#if defined(__SWITCH__)
+constexpr float kMaxViewDistance = 2.0f;  // more streams more of the city than the Switch keeps up with
+#else
+constexpr float kMaxViewDistance = 4.0f;
+#endif
+
 float view_distance_scale() noexcept {
     const float scale = lcs_render_configuration().rendering.view_distance;
     if (!std::isfinite(scale)) return 1.0f;
-    return std::clamp(scale, 1.0f, 4.0f);
+    return std::clamp(scale, 1.0f, kMaxViewDistance);
 }
 
 void lcs_set_view_distance(float value) noexcept {
     if (!std::isfinite(value)) return;
-    value = std::clamp(value, 1.0f, 4.0f);
+    value = std::clamp(value, 1.0f, kMaxViewDistance);
     std::lock_guard<std::mutex> guard(global_configuration_mutex());
     global_configuration().rendering.view_distance = value;
 }
@@ -542,6 +566,16 @@ void lcs_set_fullscreen_setting(bool enabled) noexcept {
 void lcs_set_show_fps(bool enabled) noexcept {
     std::lock_guard<std::mutex> guard(global_configuration_mutex());
     global_configuration().display.show_fps = enabled;
+}
+
+void lcs_set_nintendo_confirm(bool enabled) noexcept {
+    std::lock_guard<std::mutex> guard(global_configuration_mutex());
+    global_configuration().nx.nintendo_confirm = enabled;
+}
+
+void lcs_set_overclock(bool enabled) noexcept {
+    std::lock_guard<std::mutex> guard(global_configuration_mutex());
+    global_configuration().nx.overclock = enabled;
 }
 
 void lcs_set_frame_rate(std::uint32_t frame_rate) noexcept {
@@ -600,6 +634,24 @@ PresentationRectangle calculate_presentation_rectangle(
 
 InternalResolutionDimensions resolve_internal_resolution(
     const RenderingConfiguration &configuration) noexcept {
+#if defined(__SWITCH__)
+    // At most 3x (1440x816): larger targets run the Switch out of GPU memory
+    // and frame time for no visible gain on a 1080p TV.
+    switch (configuration.internal_resolution_mode) {
+    case InternalResolutionMode::PspNative:
+        return {480u, 272u};
+    case InternalResolutionMode::Custom:
+        return {std::clamp(configuration.internal_width, 480u, 1440u),
+                std::clamp(configuration.internal_height, 272u, 816u)};
+    case InternalResolutionMode::Scale:
+    case InternalResolutionMode::Desktop: {
+        const std::uint32_t scale = configuration.internal_resolution_mode == InternalResolutionMode::Desktop
+            ? 2u : std::clamp(configuration.internal_scale, 1u, 3u);
+        return {480u * scale, 272u * scale};
+    }
+    }
+    return {960u, 544u};
+#endif
     switch (configuration.internal_resolution_mode) {
     case InternalResolutionMode::PspNative:
         return {480u, 272u};
@@ -662,6 +714,8 @@ LcsConfiguration load_lcs_render_configuration(const std::filesystem::path &path
             apply_audio_key(config, key, value, line_number);
         else if (section == "timing")
             apply_timing_key(config, key, value, line_number);
+        else if (section == "switch")
+            apply_switch_key(config, key, value, line_number);
         else if (section == "widescreen")
             apply_widescreen_key(config, key, value, line_number);
         else if (section == "controls")
@@ -721,6 +775,9 @@ void initialize_lcs_render_configuration(const std::filesystem::path &executable
     if (std::getenv("PSPRECOMP_GE_GPU_TEXTURE_CACHE_MB") == nullptr)
         set_environment_value("PSPRECOMP_GE_GPU_TEXTURE_CACHE_MB",
                               std::to_string(config.rendering.texture_cache_mb));
+#if defined(__SWITCH__)
+    lcs_switch_set_overclock(config.nx.overclock);
+#endif
 }
 
 const LcsConfiguration &lcs_render_configuration() {

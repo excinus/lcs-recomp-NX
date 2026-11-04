@@ -18,31 +18,41 @@ Install
 
 Controls
 --------
-The PSP's buttons are where the Switch's are:
-  B = Cross (run)            A = Circle (attack)
-  Y = Square (jump)          X = Triangle (enter or leave a vehicle)
+In play, the PSP's buttons are where the Switch's are:
+  B = run                    A = attack
+  Y = jump                   X = enter or leave a vehicle
   ZR = accelerate, or aim    ZL = brake, or centre the camera
   R = aim (handbrake)        L = centre the camera, pick up a weapon
   + = pause                  - = change camera
   D-pad left/right = weapon or radio station.
   Left stick moves, right stick looks around.
-+ and - together open the host settings (FPS, view distance, ...).
+In menus, A confirms and B goes back (Settings > Confirm button = B for the
+PSP's way). The on-screen button hints show the Switch buttons.
+Any controller works: handheld, Joy-Con pair, Pro Controller.
 Change bindings in LCSNative.ini, section [Controls].
+
+Settings
+--------
+Press both sticks in (L3 + R3) during play: resolution, view distance, frame
+rate, FPS counter, confirm button, overclock. D-pad to change, B to close.
+Changes are saved; resolution applies at the next start.
 
 Speed
 -----
 If sys-clk is installed (it is in most CFW packs), the game raises the CPU
 to 1785 MHz and the memory to 1600 MHz while it is in focus, and gives the
-clocks back on HOME, sleep and exit. Turn this off in lcs_env.txt.
+clocks back on HOME, sleep and exit. Settings > Overclock turns this off.
 
-Settings
---------
-LCSNative.ini     game settings (renderer, resolution, controls)
-lcs_env.txt       Switch and debug options
-Updating by copying a new zip replaces LCSNative.ini: keep a copy of yours.
+Files
+-----
+LCSNative.ini     your settings (renderer, resolution, controls). Made from
+                  LCSNative.default.ini on first start; updates leave it
+                  alone. Delete it to get the defaults back.
+lcs_env.txt       debug options
 
 Problems
 --------
-Send lcs_log.txt and lcs_log_prev.txt from sdmc:/switch/LCSNative/, and any
-file in sdmc:/atmosphere/crash_reports/ from the time of the crash.
+Send lcs_log.txt, lcs_log_prev.txt and lcs_samples.bin from
+sdmc:/switch/LCSNative/, and any file in sdmc:/atmosphere/crash_reports/ from
+the time of the crash.
 If the picture is wrong, try Backend=Software in LCSNative.ini.

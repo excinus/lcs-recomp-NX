@@ -13,6 +13,7 @@
 #include "lcs_lang.hpp"
 #include "lcs_menu.hpp"
 #include "lcs_stress_test.hpp"
+#include "lcs_switch_hooks.hpp"
 #include "lcs_world_detail.hpp"
 
 #include "psprecomp/common.hpp"
@@ -1705,6 +1706,9 @@ bool ge_async_enabled() {
 }
 
 void ge_worker_main() {
+#if defined(__SWITCH__)
+    lcs_switch_name_current_thread("ge");
+#endif
     for (;;) {
         std::function<void()> task;
         {

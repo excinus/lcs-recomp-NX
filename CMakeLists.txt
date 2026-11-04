@@ -19,8 +19,15 @@ else()
 endif()
 option(PSPRECOMP_LTO "Enable link-time optimization" OFF)
 option(PSPRECOMP_NATIVE_AVX2 "Use AVX2 on MSVC" OFF)
-option(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH "Skip write-watch checks in AOT memory" OFF)
-option(PSPRECOMP_AOT_PRODUCTION_FASTPATHS "Strip AOT diagnostics" OFF)
+# The Switch build drops the debug-only write watch and dispatch counters: one
+# branch less on every guest store and chained call, on a slower CPU.
+if(NINTENDO_SWITCH)
+    set(_psprecomp_fast_default ON)
+else()
+    set(_psprecomp_fast_default OFF)
+endif()
+option(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH "Skip write-watch checks in AOT memory" ${_psprecomp_fast_default})
+option(PSPRECOMP_AOT_PRODUCTION_FASTPATHS "Strip AOT diagnostics" ${_psprecomp_fast_default})
 set(PSPRECOMP_MSVC_MP_JOBS "0" CACHE STRING "Max cl.exe processes (0 = all cores, 1 = off)")
 
 # Unbounded /MP with MSBuild /m runs out of memory; /MP1 can fail with D8040

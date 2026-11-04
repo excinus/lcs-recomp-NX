@@ -3,6 +3,7 @@
 #include "display_window.hpp"
 #include "host_font_5x7.hpp"
 #include "lcs_render_config.hpp"
+#include "lcs_switch_hooks.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -23,6 +24,17 @@ struct ResolutionChoice {
     const char *label;
 };
 
+#if defined(__SWITCH__)
+// The Switch GPU and its memory: 3x (1440x816) is already above the docked
+// 1080p output's needs; larger targets only cost memory and frame time.
+constexpr ResolutionChoice kResolutions[] = {
+    {InternalResolutionMode::Scale, 1u, "480x272"},
+    {InternalResolutionMode::Scale, 2u, "960x544"},
+    {InternalResolutionMode::Scale, 3u, "1440x816"},
+};
+
+constexpr float kDistances[] = {1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+#else
 constexpr ResolutionChoice kResolutions[] = {
     {InternalResolutionMode::Scale, 1u, "480x272"},
     {InternalResolutionMode::Scale, 2u, "960x544 ~540p"},
@@ -36,8 +48,28 @@ constexpr ResolutionChoice kResolutions[] = {
 };
 
 constexpr float kDistances[] = {1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 4.0f};
+#endif
 constexpr std::uint32_t kFrameRates[] = {30u, 60u};
-constexpr int kRowCount = 5;
+
+enum class Row {
+    ViewDistance,
+    Fullscreen,
+    Resolution,
+    FpsCounter,
+    FrameRate,
+    ConfirmButton,
+    Overclock,
+};
+
+#if defined(__SWITCH__)
+constexpr Row kRows[] = {Row::Resolution, Row::ViewDistance, Row::FrameRate,
+                         Row::FpsCounter, Row::ConfirmButton, Row::Overclock};
+#else
+constexpr Row kRows[] = {Row::ViewDistance, Row::Fullscreen, Row::Resolution,
+                         Row::FpsCounter, Row::FrameRate};
+#endif
+constexpr int kRowCount = static_cast<int>(std::size(kRows));
+static_assert(kRowCount <= kHostSettingsMaxRows);
 
 bool g_open = false;
 int g_selected = 0;
@@ -195,7 +227,12 @@ void save_settings() {
     char distance[16];
     std::snprintf(distance, sizeof(distance), "%.2f", view_distance_scale());
     const RenderingConfiguration &rendering = config.rendering;
+#if defined(__SWITCH__)
+    upsert_ini_line(file, "switch", "ConfirmButton", config.nx.nintendo_confirm ? "A" : "B");
+    upsert_ini_line(file, "switch", "Overclock", config.nx.overclock ? "true" : "false");
+#else
     upsert_ini_line(file, "display", "Fullscreen", config.display.fullscreen ? "true" : "false");
+#endif
     upsert_ini_line(file, "rendering", "ViewDistance", distance);
     upsert_ini_line(file, "rendering", "InternalResolutionMode",
                     internal_resolution_mode_name(rendering.internal_resolution_mode));
@@ -211,27 +248,86 @@ void save_settings() {
 }
 
 void change_selected(int direction) noexcept {
-    if (g_selected == 0) {
+    switch (kRows[g_selected]) {
+    case Row::ViewDistance: {
         const int count = static_cast<int>(std::size(kDistances));
         lcs_set_view_distance(kDistances[step_index(distance_index(), count, direction)]);
-    } else if (g_selected == 1) {
+        break;
+    }
+    case Row::Fullscreen: {
         const bool enabled = !lcs_render_configuration().display.fullscreen;
         lcs_set_fullscreen_setting(enabled);
         display_window_request_fullscreen(enabled);
-    } else if (g_selected == 2) {
+        break;
+    }
+    case Row::Resolution: {
         const int count = static_cast<int>(std::size(kResolutions));
         int index = preset_index();
         if (index < 0) index = direction < 0 ? count - 1 : 0;
         else index = step_index(index, count, direction);
         const ResolutionChoice &choice = kResolutions[index];
         lcs_set_internal_resolution(choice.mode, choice.scale);
-    } else if (g_selected == 3) {
+        break;
+    }
+    case Row::FpsCounter:
         lcs_set_show_fps(!lcs_render_configuration().display.show_fps);
-    } else {
+        break;
+    case Row::FrameRate: {
         const int index = lcs_render_configuration().timing.frame_rate == 30u ? 0 : 1;
         lcs_set_frame_rate(kFrameRates[step_index(index, static_cast<int>(std::size(kFrameRates)), direction)]);
+        break;
+    }
+    case Row::ConfirmButton:
+        lcs_set_nintendo_confirm(!lcs_render_configuration().nx.nintendo_confirm);
+        break;
+    case Row::Overclock: {
+        const bool enabled = !lcs_render_configuration().nx.overclock;
+        lcs_set_overclock(enabled);
+#if defined(__SWITCH__)
+        lcs_switch_set_overclock(enabled);
+#endif
+        break;
+    }
     }
     save_settings();
+}
+
+void format_row(Row row, char *text, std::size_t size, bool resolution_pending) noexcept {
+    const LcsConfiguration &config = lcs_render_configuration();
+    switch (row) {
+    case Row::ViewDistance: {
+        char distance[16];
+        format_distance(distance, sizeof(distance), kDistances[distance_index()]);
+        std::snprintf(text, size, "View distance   %s", distance);
+        break;
+    }
+    case Row::Fullscreen:
+        std::snprintf(text, size, "Fullscreen      %s", config.display.fullscreen ? "On" : "Off");
+        break;
+    case Row::Resolution: {
+        char resolution[24];
+        format_resolution_label(resolution, sizeof(resolution));
+        std::snprintf(text, size, "Resolution      %s%s", resolution, resolution_pending ? " *" : "");
+        break;
+    }
+    case Row::FpsCounter:
+        std::snprintf(text, size, "FPS counter     %s", config.display.show_fps ? "On" : "Off");
+        break;
+    case Row::FrameRate:
+        std::snprintf(text, size, "Frame rate      %u", config.timing.frame_rate);
+        break;
+    case Row::ConfirmButton:
+        std::snprintf(text, size, "Confirm button  %s", config.nx.nintendo_confirm ? "A" : "B");
+        break;
+    case Row::Overclock:
+#if defined(__SWITCH__)
+        std::snprintf(text, size, "Overclock       %s", !config.nx.overclock ? "Off"
+                      : lcs_switch_sysclk_available() ? "On" : "On - no sys-clk");
+#else
+        std::snprintf(text, size, "Overclock       %s", config.nx.overclock ? "On" : "Off");
+#endif
+        break;
+    }
 }
 
 }  // namespace
@@ -365,9 +461,10 @@ void rasterize_settings_overlay(const HostSettingsView &view, std::uint8_t *rgba
     const int line = 12 * scale;
     overlay_fill(rgba, width, height, 0, 0, static_cast<int>(width), static_cast<int>(height),
                  8u, 12u, 28u, 230u);
-    overlay_text(rgba, width, height, 8 * scale, 6 * scale, scale, "HOST SETTINGS", 180u, 200u, 230u);
-    overlay_text(rgba, width, height, 8 * scale, 6 * scale + line, scale, "F10 CLOSE", 180u, 200u, 230u);
-    for (int row = 0; row < 5; ++row) {
+    overlay_text(rgba, width, height, 8 * scale, 6 * scale, scale, view.title, 180u, 200u, 230u);
+    overlay_text(rgba, width, height, 8 * scale, 6 * scale + line, scale, view.hint, 180u, 200u, 230u);
+    const int rows = std::clamp(view.row_count, 0, kHostSettingsMaxRows);
+    for (int row = 0; row < rows; ++row) {
         const int y = 6 * scale + line * (2 + row);
         if (row == view.selected)
             overlay_fill(rgba, width, height, 4 * scale, y - scale,
@@ -378,7 +475,7 @@ void rasterize_settings_overlay(const HostSettingsView &view, std::uint8_t *rgba
                      row == view.selected ? 255u : 190u, row == view.selected ? 255u : 220u);
     }
     if (view.resolution_pending) {
-        overlay_text(rgba, width, height, 8 * scale, 6 * scale + line * 7, scale,
+        overlay_text(rgba, width, height, 8 * scale, 6 * scale + line * (2 + rows), scale,
                      "RESTART TO APPLY", 220u, 180u, 80u);
     }
 }
@@ -399,19 +496,13 @@ HostSettingsView host_settings_view() noexcept {
     HostSettingsView view{};
     view.selected = g_selected;
     view.resolution_pending = resolution_pending();
-    char distance[16];
-    format_distance(distance, sizeof(distance), kDistances[distance_index()]);
-    std::snprintf(view.rows[0], sizeof(view.rows[0]), "View distance   %s", distance);
-    std::snprintf(view.rows[1], sizeof(view.rows[1]), "Fullscreen      %s",
-                  lcs_render_configuration().display.fullscreen ? "On" : "Off");
-    char resolution[40];
-    format_resolution_label(resolution, sizeof(resolution));
-    std::snprintf(view.rows[2], sizeof(view.rows[2]), "Resolution      %s%s", resolution,
-                  view.resolution_pending ? " *" : "");
-    std::snprintf(view.rows[3], sizeof(view.rows[3]), "FPS counter     %s",
-                  lcs_render_configuration().display.show_fps ? "On" : "Off");
-    std::snprintf(view.rows[4], sizeof(view.rows[4]), "Frame rate      %u",
-                  lcs_render_configuration().timing.frame_rate);
+    view.row_count = kRowCount;
+#if defined(__SWITCH__)
+    view.title = "SETTINGS";
+    view.hint = "L3+R3 OR B TO CLOSE";
+#endif
+    for (int row = 0; row < kRowCount; ++row)
+        format_row(kRows[row], view.rows[row], sizeof(view.rows[row]), view.resolution_pending);
     return view;
 }
 

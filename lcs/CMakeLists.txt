@@ -141,6 +141,18 @@ else()
     target_compile_definitions(LCSNative PRIVATE LCS_NO_GENERATED)
 endif()
 
+if(NINTENDO_SWITCH)
+    # Everything links into one static PIE. Libraries default to -fPIC, which
+    # reaches globals through the GOT and treats every global function as
+    # interposable (no inlining across them); -fPIE does neither.
+    foreach(_lcs_target psprecomp_core lcs_host lcs_generated)
+        if(TARGET ${_lcs_target})
+            set_target_properties(${_lcs_target} PROPERTIES POSITION_INDEPENDENT_CODE OFF)
+            target_compile_options(${_lcs_target} PRIVATE -fPIE)
+        endif()
+    endforeach()
+endif()
+
 if(NOT NINTENDO_SWITCH)
 add_executable(lcs_host_menu_test
     ${CMAKE_SOURCE_DIR}/tests/lcs_host_menu_test.cpp
@@ -171,6 +183,7 @@ if(PSPRECOMP_BUILD_TESTS)
         add_executable(lcs_ge_gl_backend_test
             ${CMAKE_SOURCE_DIR}/tests/lcs_ge_gl_backend_test.cpp
             host/ge_gpu_backend_gl.cpp
+            host/lcs_prompt_textures.cpp
             host/lcs_render_config.cpp
             host/lcs_display_menu.cpp
             host/lcs_runtime_log.cpp)
