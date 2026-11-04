@@ -92,7 +92,7 @@ jobs:
             `switch/LCSNative/game/` (see `switch/LCSNative/README.txt`).
 
   gl-backend:
-    name: OpenGL GE backend test (desktop Mesa)
+    name: Desktop tests (OpenGL GE, settings panel, save list, allocator)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -106,6 +106,8 @@ jobs:
       - name: Build
         run: |
           cmake -S . -B out/gl -G Ninja -DCMAKE_BUILD_TYPE=Release -DLCS_GE_OPENGL=ON
-          ninja -C out/gl lcs_ge_gl_backend_test
+          ninja -C out/gl lcs_ge_gl_backend_test lcs_host_menu_test lcs_switch_malloc_test
       - name: Test
-        run: xvfb-run -a ctest --test-dir out/gl -R lcs_ge_gl_backend_test --output-on-failure
+        run: >
+          xvfb-run -a ctest --test-dir out/gl --output-on-failure
+          -R "lcs_ge_gl_backend_test|lcs_host_menu_|lcs_switch_malloc_test"
