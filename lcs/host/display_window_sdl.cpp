@@ -140,6 +140,38 @@ void apply_fullscreen_request() noexcept {
         SDL_SetWindowFullscreen(g_window, request != 0 ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
 }
 
+#if defined(__SWITCH__)
+// No keyboard on a Switch: + and - together open and close the host settings,
+// the d-pad moves through them and B (SDL's south button) closes them.
+void handle_switch_pad_button(std::uint8_t button) noexcept {
+    if (g_pad == nullptr) return;
+    const auto held = [](SDL_GameControllerButton id) {
+        return SDL_GameControllerGetButton(g_pad, id) != 0;
+    };
+    const bool combo =
+        (button == SDL_CONTROLLER_BUTTON_START && held(SDL_CONTROLLER_BUTTON_BACK)) ||
+        (button == SDL_CONTROLLER_BUTTON_BACK && held(SDL_CONTROLLER_BUTTON_START));
+    if (combo) {
+        const bool was_open = host_settings_open();
+        host_settings_handle(HostSettingsKey::Toggle);
+        if (was_open) discard_pending_pointer();
+        return;
+    }
+    if (!host_settings_open()) return;
+    switch (button) {
+    case SDL_CONTROLLER_BUTTON_DPAD_UP: host_settings_handle(HostSettingsKey::Up); break;
+    case SDL_CONTROLLER_BUTTON_DPAD_DOWN: host_settings_handle(HostSettingsKey::Down); break;
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: host_settings_handle(HostSettingsKey::Left); break;
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: host_settings_handle(HostSettingsKey::Right); break;
+    case SDL_CONTROLLER_BUTTON_A:
+        host_settings_handle(HostSettingsKey::Close);
+        discard_pending_pointer();
+        break;
+    default: break;
+    }
+}
+#endif
+
 void pump_events() noexcept {
     apply_fullscreen_request();
     SDL_Event event;
@@ -171,6 +203,10 @@ void pump_events() noexcept {
                 g_mouse_dx.fetch_add(event.motion.xrel, std::memory_order_relaxed);
                 g_mouse_dy.fetch_add(event.motion.yrel, std::memory_order_relaxed);
             }
+#if defined(__SWITCH__)
+        } else if (event.type == SDL_CONTROLLERBUTTONDOWN) {
+            handle_switch_pad_button(event.cbutton.button);
+#endif
         } else if (event.type == SDL_CONTROLLERDEVICEADDED)
             open_pad(event.cdevice.which);
         else if (event.type == SDL_CONTROLLERDEVICEREMOVED)
@@ -292,7 +328,11 @@ void paint_host_settings(SDL_Renderer *renderer) noexcept {
     fill_rect(renderer, origin_x, origin_y, panel_w, panel_h);
     SDL_SetRenderDrawColor(renderer, 180, 200, 230, 255);
     draw_text(renderer, origin_x + 8 * scale, origin_y + 6 * scale, scale, "HOST SETTINGS");
+#if defined(__SWITCH__)
+    draw_text(renderer, origin_x + 8 * scale, origin_y + 16 * scale, scale, "PLUS MINUS OR B CLOSE");
+#else
     draw_text(renderer, origin_x + 8 * scale, origin_y + 16 * scale, scale, "F10 CLOSE");
+#endif
     for (int row = 0; row < 5; ++row) {
         const int y = origin_y + (28 + row * 12) * scale;
         if (row == view.selected) {
@@ -388,6 +428,12 @@ void present_pending_frame() {
 
 void create_software_renderer() {
     if (g_window == nullptr || g_renderer != nullptr) return;
+#if defined(__SWITCH__)
+    // Scaling 480x272 to the screen on the CPU would cost the game's cores;
+    // SDL's GLES2 renderer runs on the Switch GPU through Mesa.
+    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+    if (g_renderer == nullptr)
+#endif
     g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
     if (g_renderer == nullptr) {
         std::cerr << "[window] SDL_CreateRenderer failed: " << SDL_GetError() << "\n";
@@ -411,12 +457,32 @@ void display_window_init() {
     std::lock_guard<std::mutex> guard(g_sdl_mutex);
     if (g_window != nullptr) return;
     g_window_thread = std::this_thread::get_id();
+#if defined(__SWITCH__)
+    // A touch would otherwise arrive as mouse look plus a left click (Attack).
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::cerr << "[window] SDL_Init failed: " << SDL_GetError() << "\n";
         return;
     }
     const bool nearest = lcs_render_configuration().display.upscale_filter == DisplayUpscaleFilter::Nearest;
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, nearest ? "0" : "1");
+#if defined(__SWITCH__)
+    // SDL picks the window's EGL config now, so ask for desktop GL before the
+    // window exists when the OpenGL GE will want a context on it.
+    if (lcs_render_configuration().rendering.backend != RenderingBackend::Software) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    }
+    // One full-screen layer; the system scales it to 1080p when docked.
+    const DisplaySurfaceDimensions surface{1280u, 720u};
+    const Uint32 window_flags = SDL_WINDOW_FULLSCREEN | SDL_WINDOW_SHOWN;
+    g_window = SDL_CreateWindow("LCSNative - GTA: Liberty City Stories",
+                                SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                static_cast<int>(surface.width), static_cast<int>(surface.height),
+                                window_flags | SDL_WINDOW_OPENGL);
+#else
     const DisplaySurfaceDimensions surface = resolve_window_dimensions();
     // Takes the Wayland surface, so create it only when the swapchain cannot.
     // SDL_WINDOW_VULKAN fails when the video driver has no Vulkan support.
@@ -425,6 +491,7 @@ void display_window_init() {
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 static_cast<int>(surface.width), static_cast<int>(surface.height),
                                 window_flags | SDL_WINDOW_VULKAN);
+#endif
     if (g_window == nullptr) {
         std::cerr << "[window] Vulkan window unavailable: " << SDL_GetError() << "\n";
         g_window = SDL_CreateWindow("LCSNative - GTA: Liberty City Stories",
@@ -439,7 +506,9 @@ void display_window_init() {
     SDL_ShowWindow(g_window);
     SDL_RaiseWindow(g_window);
     pump_events();
+#if !defined(__SWITCH__)
     apply_window_fullscreen(lcs_render_configuration().display.fullscreen);
+#endif
     for (int index = 0; index < SDL_NumJoysticks(); ++index) {
         open_pad(index);
         if (g_pad != nullptr) break;

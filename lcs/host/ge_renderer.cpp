@@ -182,6 +182,10 @@ bool direct_nonindexed_gpu_draw_enabled() noexcept {
 inline void raster_cpu_relax() noexcept {
 #if PSPRECOMP_GE_X86_SIMD
     _mm_pause();
+#elif defined(__SWITCH__)
+    // Horizon never time-slices threads of equal priority: a spin that waits
+    // for a thread on the same core must give the core away.
+    std::this_thread::yield();
 #else
     std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
@@ -315,7 +319,13 @@ private:
     }
 
     static constexpr unsigned kChunksPerParticipant = 4u;
+#if defined(__SWITCH__)
+    // Horizon does not time-slice threads of equal priority, so a spinning
+    // worker holds its core from the GE thread; park almost at once.
+    static constexpr unsigned kWorkerSpins = 1024u;
+#else
     static constexpr unsigned kWorkerSpins = 262144u;
+#endif
 
     std::vector<std::thread> workers_;
     void *body_context_{};

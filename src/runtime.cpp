@@ -494,7 +494,13 @@ bool Runtime::has_function(std::uint32_t address) const { return lookup_function
 std::size_t Runtime::function_count() const noexcept { return functions_.size(); }
 
 void Runtime::set_game_root(std::filesystem::path root) {
+#if defined(__SWITCH__)
+    // Horizon paths carry a device ("sdmc:/") that std::filesystem does not
+    // know; the Switch layer passes an absolute path already.
+    game_root_ = std::move(root).lexically_normal();
+#else
     game_root_ = std::filesystem::weakly_canonical(std::move(root));
+#endif
     folded_paths_.clear();
 }
 const std::filesystem::path &Runtime::game_root() const noexcept { return game_root_; }

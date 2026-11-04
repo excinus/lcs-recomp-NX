@@ -1,0 +1,27 @@
+# LCSNative on Nintendo Switch: settings read at start, one KEY=VALUE per line.
+# Remove the '#' in front of a line to use it. The Switch has no environment
+# variables, so this file stands in for them. lcs_log.txt (and the previous
+# run's lcs_log_prev.txt) are written next to this file: send them with any
+# report.
+
+# Ask sys-clk (if installed) for CPU 1785 MHz and memory 1600 MHz while the
+# game is in focus. Clocks are given back on HOME, sleep and exit. 1 = on.
+#LCS_NX_OVERCLOCK=0
+#LCS_NX_CPU_MHZ=1785
+#LCS_NX_MEM_MHZ=1600
+
+# The console's own CPU boost (1785 MHz) without sys-clk. It drops the GPU to
+# 76.8 MHz, so use it only with Backend=Software.
+#LCS_NX_CPU_BOOST=1
+
+# Threads for the software rasterizer (the GE thread counts as one).
+#PSPRECOMP_RASTER_THREADS=2
+
+# No sound (to rule the audio path out when something hangs).
+#PSPRECOMP_AUDIO=0
+
+# Run the GE on the game thread instead of its own thread.
+#LCS_GE_ASYNC=0
+
+# Mesa: 1 skips GL error checks (faster). 0 for debugging.
+#MESA_NO_ERROR=0

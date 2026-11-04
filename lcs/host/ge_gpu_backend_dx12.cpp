@@ -3581,7 +3581,7 @@ GeGpuBackendReport ge_gpu_backend_report() {
     return report;
 }
 
-#elif !defined(LCS_VULKAN_GE_BACKEND)
+#elif !defined(LCS_VULKAN_GE_BACKEND) && !defined(LCS_GL_GE_BACKEND)
 
 namespace {
 struct Dx12StubState { std::uint32_t display_framebuffer{}; };

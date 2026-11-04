@@ -110,6 +110,25 @@ backend name keeps the software rasterizer. `LCS_VULKAN_VALIDATION=1`
 turns on the Khronos validation layer and prints its warnings and
 errors.
 
+## Nintendo Switch
+
+A homebrew build for Switch consoles running Atmosphère. Download
+`LCSNative-switch-*.zip` from the releases (or the latest **Switch** workflow
+run), extract it to the root of the SD card, and put your `EBOOT.ELF` and
+`PSP_GAME` in `sdmc:/switch/LCSNative/game/` (the launcher above extracts
+them). Start the homebrew menu through a game (hold R) and pick
+**LCS Recomp**. The PSP's buttons map to the same places on the Switch
+(Cross = B, Circle = A). + and − together open the host settings.
+
+The Switch build draws with OpenGL on the console's GPU, and falls back to
+the software renderer. If sys-clk is installed, the game raises the CPU and
+memory clocks while it is in focus. Not yet tested on a console. Details,
+build steps and the porting notes: [`lcs/switch/README.md`](lcs/switch/README.md).
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src devkitpro/devkita64:latest lcs/switch/build.sh
+```
+
 ## Docker
 You also can utilize [Docker](https://www.docker.com/) to build the Linux version.
 

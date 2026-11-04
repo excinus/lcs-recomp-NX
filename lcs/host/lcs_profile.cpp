@@ -34,6 +34,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -277,6 +278,38 @@ const VirtualDiscFile *register_virtual_disc_file(const std::filesystem::path &p
     return &inserted->second;
 }
 
+#if defined(__SWITCH__)
+// Every open is a request to the SD card's file service, so the Switch keeps
+// the last few disc files open. Disc files are only ever read.
+struct CachedDiscStream {
+    std::filesystem::path path;
+    std::unique_ptr<std::ifstream> stream;
+    std::uint64_t last_used{};
+};
+std::mutex disc_stream_mutex;
+std::array<CachedDiscStream, 4> disc_streams;
+std::uint64_t disc_stream_clock = 0u;
+
+std::ifstream *cached_disc_stream(const std::filesystem::path &path) {
+    ++disc_stream_clock;
+    CachedDiscStream *oldest = &disc_streams[0];
+    for (CachedDiscStream &entry : disc_streams) {
+        if (entry.stream != nullptr && entry.path == path) {
+            entry.last_used = disc_stream_clock;
+            entry.stream->clear();
+            return entry.stream.get();
+        }
+        if (entry.last_used < oldest->last_used) oldest = &entry;
+    }
+    auto stream = std::make_unique<std::ifstream>(path, std::ios::binary);
+    if (!*stream) return nullptr;
+    oldest->path = path;
+    oldest->stream = std::move(stream);
+    oldest->last_used = disc_stream_clock;
+    return oldest->stream.get();
+}
+#endif
+
 std::size_t read_virtual_disc(VirtualDiscHandle &handle, std::span<std::uint8_t> output) {
     if (handle.position >= handle.length || output.empty()) return 0u;
     const std::uint64_t available = handle.length - handle.position;
@@ -310,8 +343,15 @@ std::size_t read_virtual_disc(VirtualDiscHandle &handle, std::span<std::uint8_t>
             const std::uint64_t file_offset = absolute - file_start;
             const std::size_t chunk = static_cast<std::size_t>(
                 std::min<std::uint64_t>(requested - written, file->size - file_offset));
+#if defined(__SWITCH__)
+            std::lock_guard<std::mutex> disc_guard(disc_stream_mutex);
+            std::ifstream *cached = cached_disc_stream(file->native_path);
+            if (cached == nullptr) break;
+            std::ifstream &input = *cached;
+#else
             std::ifstream input(file->native_path, std::ios::binary);
             if (!input) break;
+#endif
             input.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
             input.read(reinterpret_cast<char *>(output.data() + written),
                        static_cast<std::streamsize>(chunk));

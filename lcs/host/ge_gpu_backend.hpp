@@ -13,6 +13,7 @@ enum class GeGpuBackendKind : std::uint8_t {
     Software,
     DirectX12,
     Vulkan,
+    OpenGL,
 };
 
 struct GeGpuDrawDescriptor {

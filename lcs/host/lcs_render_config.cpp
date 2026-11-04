@@ -211,12 +211,15 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
                          const std::string &value, std::size_t line) {
     if (key == "backend" || key == "renderingbackend") {
         const std::string backend = lowercase_copy(trim_copy(value));
-        if (backend == "directx12" || backend == "dx12" || backend == "d3d12" || backend == "gpu")
+        if (backend == "directx12" || backend == "dx12" || backend == "d3d12" || backend == "gpu" ||
+            backend == "opengl" || backend == "gl")
             config.rendering.backend = RenderingBackend::DirectX12;
         else if (backend == "vulkan" || backend == "vk")
             config.rendering.backend = RenderingBackend::Vulkan;
+        else if (backend == "software" || backend == "cpu")
+            config.rendering.backend = RenderingBackend::Software;
         else
-            warning(config, line, "Rendering.Backend supports DirectX12 and Vulkan");
+            warning(config, line, "Rendering.Backend supports DirectX12, Vulkan, OpenGL and Software");
         return;
     }
     if (key == "internalresolutionmode" || key == "internalmode") {
@@ -763,8 +766,14 @@ const char *internal_resolution_mode_name(InternalResolutionMode mode) noexcept 
 const char *rendering_backend_name(RenderingBackend backend) noexcept {
     switch (backend) {
     case RenderingBackend::Software: return "Software";
+#if defined(LCS_GL_GE_BACKEND)
+    // The OpenGL GE takes any GPU setting (Switch, or Linux with LCS_GE_OPENGL).
+    case RenderingBackend::DirectX12: return "OpenGL";
+    case RenderingBackend::Vulkan: return "OpenGL";
+#else
     case RenderingBackend::DirectX12: return "DirectX 12";
     case RenderingBackend::Vulkan: return "Vulkan";
+#endif
     }
     return "Unknown";
 }

@@ -36,6 +36,9 @@ if(WIN32)
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/scripts/stamp_outputs.ps1
                 -Executable $<TARGET_FILE:LCSNative>)
     endif()
+elseif(NINTENDO_SWITCH)
+    # Nintendo Switch (Atmosphere homebrew). See switch/README.md.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/switch/switch.cmake)
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
@@ -43,7 +46,14 @@ else()
     pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
     pkg_check_modules(VULKAN REQUIRED IMPORTED_TARGET vulkan)
     find_package(Threads REQUIRED)
-    target_compile_definitions(lcs_host PRIVATE LCS_VULKAN_GE_BACKEND=1)
+    # LCS_GE_OPENGL builds the OpenGL GE (the Switch's) instead of Vulkan, to
+    # check that backend on a desktop. Off for normal builds.
+    option(LCS_GE_OPENGL "Use the OpenGL GE backend instead of Vulkan" OFF)
+    if(LCS_GE_OPENGL)
+        target_compile_definitions(lcs_host PRIVATE LCS_GL_GE_BACKEND=1)
+    else()
+        target_compile_definitions(lcs_host PRIVATE LCS_VULKAN_GE_BACKEND=1)
+    endif()
     target_link_libraries(lcs_host PUBLIC
         PkgConfig::FFMPEG PkgConfig::SDL2 PkgConfig::VULKAN Threads::Threads)
     # ge_spv.hpp is produced here so an edit to a shader is what the binary runs.
@@ -121,11 +131,17 @@ if(GENERATED_SOURCES)
     else()
         target_compile_options(lcs_generated PRIVATE -O2)
     endif()
+    if(NINTENDO_SWITCH)
+        # devkitPro's toolchain adds -g. Debug info for the recompiled units
+        # made them 2.5x slower to build and 12x bigger; symbols are enough.
+        target_compile_options(lcs_generated PRIVATE -g0)
+    endif()
     target_link_libraries(LCSNative PRIVATE lcs_generated)
 else()
     target_compile_definitions(LCSNative PRIVATE LCS_NO_GENERATED)
 endif()
 
+if(NOT NINTENDO_SWITCH)
 add_executable(lcs_host_menu_test
     ${CMAKE_SOURCE_DIR}/tests/lcs_host_menu_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_display_menu.cpp
@@ -138,6 +154,7 @@ if(WIN32)
 else()
     target_link_libraries(lcs_host_menu_test PRIVATE PkgConfig::SDL2 Threads::Threads)
 endif()
+endif()
 
 if(PSPRECOMP_BUILD_TESTS)
     add_executable(lcs_world_detail_test ${CMAKE_SOURCE_DIR}/tests/lcs_world_detail_test.cpp)
@@ -148,6 +165,21 @@ if(PSPRECOMP_BUILD_TESTS)
         host/lcs_stress_controller.cpp)
     target_include_directories(lcs_stress_controller_test PRIVATE host ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME lcs_stress_controller_test COMMAND lcs_stress_controller_test)
+    if(LCS_GE_OPENGL)
+        # The Switch's OpenGL GE, checked on a desktop (needs an OpenGL display;
+        # xvfb-run with Mesa is enough). Exit code 77 means skipped.
+        add_executable(lcs_ge_gl_backend_test
+            ${CMAKE_SOURCE_DIR}/tests/lcs_ge_gl_backend_test.cpp
+            host/ge_gpu_backend_gl.cpp
+            host/lcs_render_config.cpp
+            host/lcs_display_menu.cpp
+            host/lcs_runtime_log.cpp)
+        target_compile_definitions(lcs_ge_gl_backend_test PRIVATE LCS_GL_GE_BACKEND=1)
+        target_include_directories(lcs_ge_gl_backend_test PRIVATE host ${CMAKE_SOURCE_DIR}/include)
+        target_link_libraries(lcs_ge_gl_backend_test PRIVATE PkgConfig::SDL2 Threads::Threads)
+        add_test(NAME lcs_ge_gl_backend_test COMMAND lcs_ge_gl_backend_test)
+        set_tests_properties(lcs_ge_gl_backend_test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     add_executable(lcs_stress_safety_test ${CMAKE_SOURCE_DIR}/tests/lcs_stress_safety_test.cpp)
     target_link_libraries(lcs_stress_safety_test PRIVATE lcs_host)
     add_test(NAME lcs_stress_safety_test COMMAND lcs_stress_safety_test)
