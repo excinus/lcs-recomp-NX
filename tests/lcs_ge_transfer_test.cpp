@@ -1,5 +1,5 @@
 // The GE's block transfer (TRXKICK): a 32-bit picture in RAM copied into a
-// VRAM framebuffer at an offset, as the game's loading cards are.
+// VRAM framebuffer at an offset.
 #include "lcs_ge_exec.hpp"
 
 #include "psprecomp/guest_memory.hpp"
@@ -36,11 +36,6 @@ int main() {
             if (got != want) ++failures;
         }
     if (memory.load32(kFramebuffer + (100u * 512u + 205u) * 4u) != 0u) ++failures;  // right of the rectangle
-    const lcs::GeBlockTransfers taken = lcs::ge_block_transfers_take();
-    if (taken.count != 1u || taken.last_destination != (kFramebuffer & 0x0FFFFFFFu) || taken.last_width != 5u ||
-        taken.last_height != 3u)
-        ++failures;
-    if (lcs::ge_block_transfers_take().count != 0u) ++failures;
     std::printf("%s block transfer (%d bad)\n", failures == 0 ? "ok" : "FAIL", failures);
     return failures == 0 ? 0 : 1;
 }

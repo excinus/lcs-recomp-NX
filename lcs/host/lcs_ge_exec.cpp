@@ -21,30 +21,8 @@ std::uint32_t ge_finish_arg = 0u;
 
 constexpr std::uint32_t kMaxCommands = 2'000'000u;
 
-GeBlockTransfers block_transfers{};
-GeListDigest list_digest{};
-
-void note_primitive(std::uint32_t data) {
-    GeListDigest &digest = list_digest;
-    const std::uint32_t primitive = (data >> 16u) & 7u;
-    ++digest.primitives;
-    ++digest.by_type[primitive];
-    if (digest.recorded < digest.first.size()) {
-        GeListDigest::Primitive &record = digest.first[digest.recorded++];
-        record.type = primitive;
-        record.count = data & 0xFFFFu;
-        record.vertex_type = ge_commands[0x12u] & 0x00FFFFFFu;
-        record.framebuffer = ((ge_commands[0x9Cu] & 0x00FFFFF0u) | ((ge_commands[0x9Du] & 0x00FF0000u) << 8u));
-        record.textured = (ge_commands[0x1Eu] & 1u) != 0u;
-        record.texture_format = ge_commands[0xC3u] & 0xFu;
-        record.texture = (ge_commands[0xA0u] & 0x00FFFFF0u) | ((ge_commands[0xA8u] & 0x000F0000u) << 8u);
-        record.clear = (ge_commands[0xD3u] & 1u) != 0u;
-    }
-}
-
 // TRXKICK (0xEA): the GE's rectangle copy between two buffers in guest
-// memory, as the game uses it to put a whole picture (a loading card) into a
-// framebuffer. Registers: 0xB0/0xB1 source address and stride, 0xB2/0xB3
+// memory. Registers: 0xB0/0xB1 source address and stride, 0xB2/0xB3
 // destination, 0xEB/0xEC source and destination x,y, 0xEE size; bit 0 of the
 // kick selects 32-bit pixels.
 void run_block_transfer(psprecomp::GuestMemory &memory, std::uint32_t kick) {
@@ -62,10 +40,6 @@ void run_block_transfer(psprecomp::GuestMemory &memory, std::uint32_t kick) {
     const std::uint32_t width = (ge_commands[0xEEu] & 0x3FFu) + 1u;
     const std::uint32_t height = ((ge_commands[0xEEu] >> 10u) & 0x3FFu) + 1u;
     const std::uint32_t bytes_per_pixel = (kick & 1u) != 0u ? 4u : 2u;
-    ++block_transfers.count;
-    block_transfers.last_destination = destination;
-    block_transfers.last_width = width;
-    block_transfers.last_height = height;
     if (source_stride == 0u || destination_stride == 0u) return;
     const std::size_t row_bytes = static_cast<std::size_t>(width) * bytes_per_pixel;
     for (std::uint32_t row = 0u; row < height; ++row) {
@@ -147,7 +121,6 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
             GeRenderStats stats{};
             std::string error;
             lcs_set_ge_command(op_pc);
-            note_primitive(data);
             if (!render_ge_primitive(memory, ge_commands, ge_transform, ge_vertex_address,
                                      ge_index_address, data, stats, error)) {
                 flush_ge_deferred_rasterization(memory);
@@ -162,18 +135,6 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
         }
     }
     flush_ge_deferred_rasterization(memory);
-}
-
-GeListDigest ge_list_digest_take() {
-    const GeListDigest taken = list_digest;
-    list_digest = GeListDigest{};
-    return taken;
-}
-
-GeBlockTransfers ge_block_transfers_take() {
-    const GeBlockTransfers taken = block_transfers;
-    block_transfers = GeBlockTransfers{};
-    return taken;
 }
 
 GeListPrescan prescan_ge_list(psprecomp::GuestMemory &memory, std::uint32_t list_address) {

@@ -208,6 +208,10 @@ if(PSPRECOMP_BUILD_TESTS)
         add_test(NAME lcs_ge_gl_backend_test_per_draw COMMAND lcs_ge_gl_backend_test)
         set_tests_properties(lcs_ge_gl_backend_test_per_draw PROPERTIES SKIP_RETURN_CODE 77
                              ENVIRONMENT "LCS_GL_BATCHED_UNIFORMS=0")
+        # Frames drawn on the GL thread (the Switch default).
+        add_test(NAME lcs_ge_gl_backend_test_gl_thread COMMAND lcs_ge_gl_backend_test)
+        set_tests_properties(lcs_ge_gl_backend_test_gl_thread PROPERTIES SKIP_RETURN_CODE 77
+                             ENVIRONMENT "LCS_GL_THREAD=1")
     endif()
     if(NOT WIN32)
         # The Switch build's allocator (lcs/switch/switch_malloc.cpp) over a fake heap.

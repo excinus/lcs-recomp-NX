@@ -292,7 +292,6 @@ int main(int argc, char **argv) {
     // Twice: the second frame is the steady state with every texture resident.
     // It runs on another thread, as the GE worker does in the game, so the
     // context moves between threads.
-    ge_gpu_describe_next_frame().store(true);  // the stalled-frame log runs once
     bool ok = run_frame(1, dir.string().c_str());
     bool second = false;
     std::thread worker([&] { second = run_frame(3, dir.string().c_str()); });

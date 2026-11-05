@@ -5,7 +5,8 @@
 
 #if defined(__SWITCH__)
 extern "C" {
-// Names the calling thread in the profiler's log lines.
+// Names the calling thread in the profiler's log lines; "ge" also moves it
+// to the core kept for the GE worker.
 void lcs_switch_name_current_thread(const char *name);
 }
 #endif

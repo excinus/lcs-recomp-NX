@@ -33,14 +33,19 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
@@ -201,6 +206,29 @@ struct UploadVertex {
     float q{1.0f};
 };
 static_assert(sizeof(UploadVertex) == 36u);
+static_assert(std::is_trivially_copyable_v<UploadVertex>);
+
+// resize() through this allocator leaves the new elements as they are: the
+// accumulators write every vertex right after growing the vector, and giving
+// each its default values first was 2% of the GE thread on the Switch.
+template <class T>
+struct UninitializedAllocator : std::allocator<T> {
+    using value_type = T;
+    template <class U>
+    struct rebind {
+        using other = UninitializedAllocator<U>;
+    };
+    UninitializedAllocator() noexcept = default;
+    template <class U>
+    UninitializedAllocator(const UninitializedAllocator<U> &) noexcept {}
+    template <class U>
+    void construct(U *) noexcept {}
+    template <class U, class... Args>
+    void construct(U *pointer, Args &&...args) {
+        ::new (static_cast<void *>(pointer)) U(std::forward<Args>(args)...);
+    }
+};
+using UploadVertices = std::vector<UploadVertex, UninitializedAllocator<UploadVertex>>;
 
 struct DrawUniforms {
     float row0[4]{};
@@ -281,6 +309,33 @@ struct PlannedDraw {
     GLuint texture{};
     Target *source_target{};
     bool textured{};
+    // The target's logical size when planned (the GE thread may change it
+    // while the GL thread draws).
+    std::uint32_t logical_width{kReferenceWidth};
+    std::uint32_t logical_height{kReferenceHeight};
+};
+
+// One finished frame on its way to the GPU: what the GE thread accumulated,
+// moved out of GlState so the GE thread can start the next frame while this
+// one is uploaded and drawn (see GlThread).
+struct FrameJob {
+    UploadVertices vertices;
+    std::vector<std::uint32_t> indices;
+    std::vector<Batch> batches;
+    std::vector<PlannedDraw> plan;
+    std::vector<std::byte> uniform_bytes;
+    std::uint64_t epoch{};
+    std::uint64_t vblank{};
+    std::uint32_t display_framebuffer{};
+    bool publish{};
+    Target *display{};  // found while planning
+    std::size_t draws{};
+    // Filled while drawing.
+    bool touched_display{};
+    bool presented{};
+    bool read_back{};
+    std::uint64_t feedback_draws{};
+    std::uint64_t snapshots{};
 };
 
 struct CachedState {
@@ -358,11 +413,9 @@ struct GlState {
     std::unordered_map<std::uint64_t, GLuint> samplers{};
     std::unordered_map<std::uint64_t, Texture> textures{};
     std::unordered_map<std::uint32_t, Target> targets{};
-    std::vector<UploadVertex> vertices;
+    UploadVertices vertices;
     std::vector<std::uint32_t> indices;
     std::vector<Batch> batches;
-    std::vector<PlannedDraw> plan;
-    std::vector<std::byte> uniform_bytes;
     std::vector<std::byte> frame_rgba;
     std::vector<std::byte> last_texture_rgba;
     std::uint32_t target_width{kReferenceWidth};
@@ -896,16 +949,16 @@ void clear_target_full(GlState &s, bool color, bool depth) {
     s.cache = CachedState{};
 }
 
-void begin_target(GlState &s, Target &target) {
+void begin_target(GlState &s, Target &target, std::uint64_t epoch, std::uint32_t display_framebuffer) {
     if (s.bound_target == &target) return;
     gl.BindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
     gl.Viewport(0, 0, static_cast<GLsizei>(s.target_width), static_cast<GLsizei>(s.target_height));
     const bool first_ever = target.last_render_epoch == 0u;
-    const bool first_this_frame = target.last_render_epoch != s.frame_epoch;
-    const bool clear_color = first_ever || (first_this_frame && target.address == s.display_framebuffer);
+    const bool first_this_frame = target.last_render_epoch != epoch;
+    const bool clear_color = first_ever || (first_this_frame && target.address == display_framebuffer);
     if (clear_color || first_this_frame) clear_target_full(s, clear_color, first_this_frame);
     s.bound_target = &target;
-    target.last_render_epoch = s.frame_epoch;
+    target.last_render_epoch = epoch;
 }
 
 bool snapshot_target(GlState &s, Target &target) {
@@ -924,12 +977,13 @@ bool snapshot_target(GlState &s, Target &target) {
 // ---------------------------------------------------------------------------
 // Textures.
 
-void evict_stale_textures(GlState &s) {
+// Textures not used since before `epoch` (the frame being drawn) go first.
+void evict_stale_textures(GlState &s, std::uint64_t epoch) {
     if (s.textures.size() <= kMaxTextures) return;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> stale;
     stale.reserve(s.textures.size());
     for (const auto &entry : s.textures) {
-        if (entry.second.last_used_epoch >= s.frame_epoch) continue;
+        if (entry.second.last_used_epoch >= epoch) continue;
         stale.emplace_back(entry.second.last_used_epoch, entry.first);
     }
     std::sort(stale.begin(), stale.end());
@@ -1658,11 +1712,15 @@ bool create_backend(GlState &s, std::string &error) {
 
 }  // namespace
 
+// Waits for the GL thread's last job and ends the thread (defined with it).
+void stop_gl_thread() noexcept;
+
 // ---------------------------------------------------------------------------
 // The backend interface (ge_gpu_backend.hpp).
 
 bool initialize_ge_gpu_backend(std::string &error) {
     GlState &s = state();
+    stop_gl_thread();
     std::lock_guard<std::recursive_mutex> guard(s.mutex);
     destroy_backend(s);
     s.report = {};
@@ -1706,6 +1764,7 @@ bool initialize_ge_gpu_backend(std::string &error) {
 
 void shutdown_ge_gpu_backend() noexcept {
     GlState &s = state();
+    stop_gl_thread();
     std::lock_guard<std::recursive_mutex> guard(s.mutex);
     destroy_backend(s);
     s.report = {};
@@ -1885,93 +1944,6 @@ bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte> destination) noe
     return true;
 }
 
-namespace {
-
-// The draws of one frame, for the log (see ge_gpu_describe_next_frame).
-void describe_draw(const GlState &s, std::size_t index) {
-    const Batch &batch = s.batches[index];
-    const PlannedDraw &plan = s.plan[index];
-    const GeGpuDrawDescriptor &d = batch.draw;
-    const UploadVertex &first = s.vertices[std::min<std::size_t>(batch.first_vertex, s.vertices.empty() ? 0u : s.vertices.size() - 1u)];
-    const UploadVertex &last = s.vertices[std::min<std::size_t>(
-        batch.first_vertex + (batch.vertex_count == 0u ? 0u : batch.vertex_count - 1u),
-        s.vertices.empty() ? 0u : s.vertices.size() - 1u)];
-    std::printf("[gl]  #%zu fb=0x%x%s %s n=%u tex=%s fmt=%u 0x%x %ux%u src=%d depth=%d/%u wr=%d blend=%d %u/%u "
-                "atest=%d %u/%u mask=0x%x sc=%d,%d-%d,%d rgba=%08x z=%.1f xy=%.0f,%.0f..%.0f,%.0f\n",
-                index, d.framebuffer_address, plan.target == nullptr ? "(none)" : "",
-                d.through ? "2d" : "3d", batch.indexed ? batch.index_count : batch.vertex_count,
-                d.texture_enabled ? "on" : "off", d.texture_format, d.texture_address, d.texture_width,
-                d.texture_height, static_cast<int>(plan.source), d.depth_test_enabled ? 1 : 0, d.depth_function,
-                d.depth_write_enabled ? 1 : 0, d.blend_enabled ? 1 : 0, d.blend_source_factor, d.blend_dest_factor,
-                d.alpha_test_enabled ? 1 : 0, d.alpha_function, d.alpha_reference, d.color_write_mask,
-                d.scissor_x0, d.scissor_y0, d.scissor_x1, d.scissor_y1, first.rgba, static_cast<double>(first.z),
-                static_cast<double>(first.x), static_cast<double>(first.y), static_cast<double>(last.x),
-                static_cast<double>(last.y));
-}
-
-// The stalled-frame report: draws per target, the first and last draws, and
-// every 2D draw with a large texture (a loading card is one).
-void describe_frame(const GlState &s, std::size_t draws) {
-    std::printf("[gl] frame of %zu draws, display 0x%x\n", draws, s.display_framebuffer);
-    std::unordered_map<std::uint32_t, std::size_t> per_target;
-    for (std::size_t index = 0u; index < draws; ++index) ++per_target[s.batches[index].draw.framebuffer_address];
-    for (const auto &[address, count] : per_target)
-        std::printf("[gl]  target 0x%x: %zu draws\n", address, count);
-    std::vector<bool> shown(draws, false);
-    const auto show = [&](std::size_t index) {
-        if (index >= draws || shown[index]) return;
-        shown[index] = true;
-        describe_draw(s, index);
-    };
-    for (std::size_t index = 0u; index < std::min<std::size_t>(draws, 16u); ++index) show(index);
-    std::size_t large = 0u;
-    for (std::size_t index = 0u; index < draws && large < 40u; ++index) {
-        const GeGpuDrawDescriptor &d = s.batches[index].draw;
-        if (d.through && d.texture_enabled && d.texture_width >= 256u && !shown[index]) {
-            show(index);
-            ++large;
-        }
-    }
-    for (std::size_t index = draws > 24u ? draws - 24u : 0u; index < draws; ++index) show(index);
-    std::fflush(stdout);
-}
-
-// The frame as drawn into `target`, as a 24-bit BMP (the stalled-frame report).
-void dump_target_bmp(GlState &s, const Target &target, const char *path) {
-    const std::uint32_t width = s.target_width;
-    const std::uint32_t height = s.target_height;
-    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4u);
-    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
-    gl.ReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE,
-                  rgba.data());
-    const std::uint32_t row_bytes = (width * 3u + 3u) & ~3u;
-    std::vector<std::uint8_t> file(54u + static_cast<std::size_t>(row_bytes) * height, 0u);
-    const auto put32 = [&](std::size_t at, std::uint32_t value) {
-        for (int byte = 0; byte < 4; ++byte) file[at + byte] = static_cast<std::uint8_t>(value >> (8 * byte));
-    };
-    file[0] = 'B'; file[1] = 'M';
-    put32(2, static_cast<std::uint32_t>(file.size())); put32(10, 54u); put32(14, 40u);
-    put32(18, width); put32(22, height); file[26] = 1; file[28] = 24;
-    put32(34, row_bytes * height);
-    // Row 0 of the target is the PSP's top line; a BMP starts at the bottom.
-    for (std::uint32_t y = 0; y < height; ++y) {
-        const std::uint8_t *in = rgba.data() + static_cast<std::size_t>(y) * width * 4u;
-        std::uint8_t *out = file.data() + 54u + static_cast<std::size_t>(height - 1u - y) * row_bytes;
-        for (std::uint32_t x = 0; x < width; ++x) {
-            out[x * 3u + 0u] = in[x * 4u + 2u];
-            out[x * 3u + 1u] = in[x * 4u + 1u];
-            out[x * 3u + 2u] = in[x * 4u + 0u];
-        }
-    }
-    if (std::FILE *output = std::fopen(path, "wb")) {
-        std::fwrite(file.data(), 1u, file.size(), output);
-        std::fclose(output);
-        std::printf("[gl]  saved %s (%ux%u)\n", path, width, height);
-    }
-}
-
-}  // namespace
-
 void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
                                                std::span<const GeGpuVertex> triangle_vertices) noexcept {
     GlState &s = state();
@@ -2129,75 +2101,27 @@ void ge_gpu_backend_display_logical_size(std::uint32_t &width, std::uint32_t &he
     height = s.display_logical_height;
 }
 
-bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
-    GlState &s = state();
-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
-    const bool publish = ge_finish_shows_this_frame();
-    const auto reset_frame = [&]() {
-        s.vertices.clear();
-        s.indices.clear();
-        s.batches.clear();
-        s.plan.clear();
-        ++s.frame_epoch;
-    };
-    if (!s.enabled || s.batches.empty()) {
-        reset_frame();
-        return false;
-    }
-    const std::size_t vertex_bytes = s.vertices.size() * sizeof(UploadVertex);
-    const std::size_t index_bytes = s.indices.size() * sizeof(std::uint32_t);
-    if (vertex_bytes + index_bytes > kGeometryUploadCapacity) {
-        ++s.report.game_vertex_overflows;
-        reset_frame();
-        return false;
-    }
-    ContextScope scope(s);
-    if (!scope.ok()) {
-        static std::uint64_t failures = 0u;
-        if (++failures <= 5u) std::cerr << "[gl] could not make the context current: " << SDL_GetError() << "\n";
-        reset_frame();
-        return false;
-    }
+namespace {
 
-    // Uploads: textures decoded this frame, geometry.
-    evict_stale_textures(s);
+// Phase A, with s.mutex held: textures up, targets made, every draw planned
+// and its uniform block laid out.
+void plan_frame(GlState &s, FrameJob &job) {
+    evict_stale_textures(s, job.epoch);
     for (auto &entry : s.textures) upload_texture(s, entry.second);
-    gl.BindVertexArray(s.vao);
-    GlState::UploadSlot *slot = nullptr;
-    if (s.upload_ring) {
-        s.upload_slot = (s.upload_slot + 1u) % s.upload_slots.size();
-        slot = &s.upload_slots[s.upload_slot];
-        s.vertex_buffer = slot->vertex;
-        s.index_buffer = slot->index;
-        s.uniform_buffer = slot->uniform;
-        upload_into(GL_ARRAY_BUFFER, slot->vertex, slot->vertex_capacity, s.vertices.data(), vertex_bytes);
-        point_vertex_attributes(slot->vertex);
-        upload_into(GL_ELEMENT_ARRAY_BUFFER, slot->index, slot->index_capacity, s.indices.data(), index_bytes);
-    } else {
-        gl.BindBuffer(GL_ARRAY_BUFFER, s.vertex_buffer);
-        gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertex_bytes), nullptr, GL_STREAM_DRAW);
-        gl.BufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vertex_bytes), s.vertices.data());
-        if (index_bytes != 0u) {
-            gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.index_buffer);
-            gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(index_bytes), nullptr, GL_STREAM_DRAW);
-            gl.BufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(index_bytes), s.indices.data());
-        }
-    }
-
-    // Plan every batch and lay out its uniforms, so they go up at once.
     std::string error;
-    const std::size_t draws = std::min<std::size_t>(s.batches.size(), kMaxDraws);
-    s.plan.assign(draws, PlannedDraw{});
+    const std::size_t draws = std::min<std::size_t>(job.batches.size(), kMaxDraws);
+    job.draws = draws;
+    job.plan.assign(draws, PlannedDraw{});
     const auto uniform_offset = [&](std::size_t index) -> std::size_t {
         if (!s.batched) return index * s.uniform_align;
         return (index / s.draw_chunk) * s.chunk_stride + (index % s.draw_chunk) * sizeof(DrawUniforms);
     };
-    s.uniform_bytes.assign(s.batched ? ((draws + s.draw_chunk - 1u) / s.draw_chunk) * s.chunk_stride
-                                     : draws * s.uniform_align,
-                           std::byte{0});
+    job.uniform_bytes.assign(s.batched ? ((draws + s.draw_chunk - 1u) / s.draw_chunk) * s.chunk_stride
+                                       : draws * s.uniform_align,
+                             std::byte{0});
     for (std::size_t index = 0u; index < draws; ++index) {
-        const Batch &batch = s.batches[index];
-        PlannedDraw &plan = s.plan[index];
+        const Batch &batch = job.batches[index];
+        PlannedDraw &plan = job.plan[index];
         ensure_target(s, batch.draw.framebuffer_address);
         Target *target = find_target(s, batch.draw.framebuffer_address);
         if (target == nullptr || !realize_target(s, *target, error)) {
@@ -2206,6 +2130,8 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             continue;
         }
         plan.target = target;
+        plan.logical_width = target->logical_width;
+        plan.logical_height = target->logical_height;
         if (batch.draw.texture_enabled) {
             if (batch.framebuffer_feedback && batch.feedback_address == target->address) {
                 plan.source = SourceKind::TargetSnapshot;
@@ -2228,17 +2154,42 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         }
         const DrawUniforms uniforms =
             make_uniforms(batch, target->logical_width, target->logical_height, plan.textured);
-        std::memcpy(s.uniform_bytes.data() + uniform_offset(index), &uniforms, sizeof(uniforms));
+        std::memcpy(job.uniform_bytes.data() + uniform_offset(index), &uniforms, sizeof(uniforms));
+        count_draw(s, batch, plan.textured);
     }
-    const bool describe = publish && ge_gpu_describe_next_frame().exchange(false);
-    if (describe) describe_frame(s, draws);
-    if (slot != nullptr) {
-        upload_into(GL_UNIFORM_BUFFER, slot->uniform, slot->uniform_capacity, s.uniform_bytes.data(),
-                    s.uniform_bytes.size());
+    job.display = find_target(s, job.display_framebuffer);
+}
+
+// Phase B, without s.mutex on the GL thread: geometry and uniforms up, the
+// draws, the present. Touches only the job, GL objects and GL-only state.
+void draw_frame(GlState &s, FrameJob &job) {
+    const std::size_t vertex_bytes = job.vertices.size() * sizeof(UploadVertex);
+    const std::size_t index_bytes = job.indices.size() * sizeof(std::uint32_t);
+    gl.BindVertexArray(s.vao);
+    GlState::UploadSlot *slot = nullptr;
+    if (s.upload_ring) {
+        s.upload_slot = (s.upload_slot + 1u) % s.upload_slots.size();
+        slot = &s.upload_slots[s.upload_slot];
+        s.vertex_buffer = slot->vertex;
+        s.index_buffer = slot->index;
+        s.uniform_buffer = slot->uniform;
+        upload_into(GL_ARRAY_BUFFER, slot->vertex, slot->vertex_capacity, job.vertices.data(), vertex_bytes);
+        point_vertex_attributes(slot->vertex);
+        upload_into(GL_ELEMENT_ARRAY_BUFFER, slot->index, slot->index_capacity, job.indices.data(), index_bytes);
+        upload_into(GL_UNIFORM_BUFFER, slot->uniform, slot->uniform_capacity, job.uniform_bytes.data(),
+                    job.uniform_bytes.size());
     } else {
+        gl.BindBuffer(GL_ARRAY_BUFFER, s.vertex_buffer);
+        gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertex_bytes), nullptr, GL_STREAM_DRAW);
+        gl.BufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vertex_bytes), job.vertices.data());
+        if (index_bytes != 0u) {
+            gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.index_buffer);
+            gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(index_bytes), nullptr, GL_STREAM_DRAW);
+            gl.BufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(index_bytes), job.indices.data());
+        }
         gl.BindBuffer(GL_UNIFORM_BUFFER, s.uniform_buffer);
-        gl.BufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(s.uniform_bytes.size()), s.uniform_bytes.data(),
-                      GL_STREAM_DRAW);
+        gl.BufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(job.uniform_bytes.size()),
+                      job.uniform_bytes.data(), GL_STREAM_DRAW);
     }
     check_gl(s, "frame uploads");
 
@@ -2247,24 +2198,23 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     gl.Enable(GL_SCISSOR_TEST);
     s.cache = CachedState{};
     s.bound_target = nullptr;
-    bool touched_display = false;
     std::size_t bound_chunk = static_cast<std::size_t>(-1);
-    for (std::size_t index = 0u; index < draws; ++index) {
-        const Batch &batch = s.batches[index];
-        const PlannedDraw &plan = s.plan[index];
+    for (std::size_t index = 0u; index < job.draws; ++index) {
+        const Batch &batch = job.batches[index];
+        const PlannedDraw &plan = job.plan[index];
         Target *target = plan.target;
         if (target == nullptr) continue;
-        begin_target(s, *target);
-        if (target->address == s.display_framebuffer) touched_display = true;
+        begin_target(s, *target, job.epoch, job.display_framebuffer);
+        if (target->address == job.display_framebuffer) job.touched_display = true;
         const auto scale = [&](std::int32_t value, std::uint32_t logical, std::uint32_t target_size) {
             return static_cast<std::int32_t>(std::clamp<std::int64_t>(
                 static_cast<std::int64_t>(value) * target_size / std::max<std::uint32_t>(1u, logical),
                 0, target_size));
         };
-        const std::int32_t left = scale(batch.draw.scissor_x0, target->logical_width, s.target_width);
-        const std::int32_t top = scale(batch.draw.scissor_y0, target->logical_height, s.target_height);
-        const std::int32_t right = scale(batch.draw.scissor_x1 + 1, target->logical_width, s.target_width);
-        const std::int32_t bottom = scale(batch.draw.scissor_y1 + 1, target->logical_height, s.target_height);
+        const std::int32_t left = scale(batch.draw.scissor_x0, plan.logical_width, s.target_width);
+        const std::int32_t top = scale(batch.draw.scissor_y0, plan.logical_height, s.target_height);
+        const std::int32_t right = scale(batch.draw.scissor_x1 + 1, plan.logical_width, s.target_width);
+        const std::int32_t bottom = scale(batch.draw.scissor_y1 + 1, plan.logical_height, s.target_height);
         if (right <= left || bottom <= top) continue;
         // Row 0 is the PSP's top line (see the top of this file).
         const std::array<GLint, 4> scissor{left, top, right - left, bottom - top};
@@ -2287,16 +2237,14 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         case SourceKind::TargetColor:
             texture = plan.source_target->color;
             sampler = sampler_for(s, batch.draw);
-            ++s.report.vram_feedback_refreshes;
-            ++s.report.gpu_feedback_draws;
+            ++job.feedback_draws;
             break;
         case SourceKind::TargetSnapshot:
             if (snapshot_target(s, *plan.source_target)) {
                 texture = plan.source_target->snapshot;
                 sampler = sampler_for(s, batch.draw);
-                ++s.report.vram_feedback_refreshes;
-                ++s.report.gpu_feedback_draws;
-                ++s.report.self_feedback_snapshots;
+                ++job.feedback_draws;
+                ++job.snapshots;
             }
             break;
         case SourceKind::White:
@@ -2340,51 +2288,235 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                 gl.DrawArrays(mode, static_cast<GLint>(batch.first_vertex),
                               static_cast<GLsizei>(batch.vertex_count));
         }
-        count_draw(s, batch, plan.textured);
     }
     gl.BindSampler(0u, 0u);
     gl.BindVertexArray(0u);
     check_gl(s, "frame draws");
 
-    Target *display = find_target(s, s.display_framebuffer);
-    const bool display_ready = touched_display && display != nullptr && display->framebuffer != 0u;
-    if (describe) {
-        static int dumps = 0;
-        if (display_ready && dumps < 12) {
-            char path[32];
-            std::snprintf(path, sizeof(path), "stall%d_gpu.bmp", ++dumps);
-            dump_target_bmp(s, *display, path);
-        } else if (!display_ready) {
-            std::printf("[gl]  this frame did not draw into the displayed target\n");
-        }
-        std::fflush(stdout);
-    }
-    bool presented_now = false;
-    bool read_back = false;
-    if (publish && display_ready) {
-        if (!s.readback_mode) {
-            presented_now = present_to_window(s, display->color, s.target_width, s.target_height);
-            s.direct_present_ok = s.direct_present_ok || presented_now;
-        }
-        if (!presented_now) {
+    Target *display = job.display;
+    const bool display_ready = job.touched_display && display != nullptr && display->framebuffer != 0u;
+    job.touched_display = display_ready;
+    if (job.publish && display_ready) {
+        if (!s.readback_mode) job.presented = present_to_window(s, display->color, s.target_width, s.target_height);
+        if (!job.presented) {
             s.frame_rgba.resize(static_cast<std::size_t>(s.target_width) * s.target_height * 4u);
             gl.BindFramebuffer(GL_READ_FRAMEBUFFER, display->framebuffer);
             gl.ReadPixels(0, 0, static_cast<GLsizei>(s.target_width), static_cast<GLsizei>(s.target_height),
                           GL_RGBA, GL_UNSIGNED_BYTE, s.frame_rgba.data());
-            read_back = true;
-            s.report.game_frame_readback_bytes = s.frame_rgba.size();
+            job.read_back = true;
         }
     }
-    if (!display_ready) ++s.report.frames_without_displayed_target;
+}
+
+// Phase C, with s.mutex held: the frame's numbers.
+void report_frame(GlState &s, const FrameJob &job) {
+    if (job.presented) s.direct_present_ok = true;
+    if (job.read_back) s.report.game_frame_readback_bytes = s.frame_rgba.size();
+    s.report.vram_feedback_refreshes += job.feedback_draws;
+    s.report.gpu_feedback_draws += job.feedback_draws;
+    s.report.self_feedback_snapshots += job.snapshots;
+    if (!job.touched_display) ++s.report.frames_without_displayed_target;
     ++s.report.game_frames;
-    s.report.game_frame_vblank = vblank;
+    s.report.game_frame_vblank = job.vblank;
     s.report.offscreen_width = s.target_width;
     s.report.offscreen_height = s.target_height;
-    s.report.presented_framebuffer_target = display_ready ? s.display_framebuffer : 0u;
-    s.report.gpu_frame_presented_to_window = presented_now;
+    s.report.presented_framebuffer_target = job.touched_display ? job.display_framebuffer : 0u;
+    s.report.gpu_frame_presented_to_window = job.presented;
     s.report.swapchain_active = !s.readback_mode;
-    reset_frame();
-    return presented_now || read_back;
+}
+
+// The GL thread. The GE worker used to upload and draw each frame itself,
+// and the driver's part of that (submissions, buffer copies, waits) was about
+// a third of its time on the Switch, while the GE worker is what holds the
+// frame rate there. With the GL thread the GE worker hands the frame over
+// and decodes the next one while this thread draws it (one frame in flight).
+// Every GL call then happens here: the guest-frame present runs here too.
+// Switch default; LCS_GL_THREAD=1 / 0 elsewhere.
+bool gl_thread_enabled() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("LCS_GL_THREAD");
+        if (text != nullptr && *text != '\0') return std::strcmp(text, "0") != 0;
+#if defined(__SWITCH__)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return enabled;
+}
+
+class GlThread {
+public:
+    ~GlThread() { stop(); }
+
+    // Waits until nothing is queued or running.
+    void wait_idle() {
+        std::unique_lock lock(mutex_);
+        done_.wait(lock, [this] { return !pending_ && !running_; });
+    }
+
+    // Runs `job` on the thread; returns once it is queued (or, with `wait`,
+    // done). The caller has waited for idle, so the slot is free.
+    void post(std::function<void()> job, bool wait) {
+        {
+            std::unique_lock lock(mutex_);
+            done_.wait(lock, [this] { return !pending_ && !running_; });
+            if (!thread_.joinable()) {
+                stop_ = false;
+                thread_ = std::thread([this] { run(); });
+            }
+            job_ = std::move(job);
+            pending_ = true;
+        }
+        wake_.notify_all();
+        if (wait) wait_idle();
+    }
+
+    void stop() {
+        {
+            std::unique_lock lock(mutex_);
+            if (!thread_.joinable()) return;
+            done_.wait(lock, [this] { return !pending_ && !running_; });
+            stop_ = true;
+        }
+        wake_.notify_all();
+        thread_.join();
+    }
+
+    // The frame being handed over (free while the thread is idle).
+    FrameJob frame;
+
+private:
+    void run() {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [this] { return pending_ || stop_; });
+                if (!pending_) return;
+                job = std::move(job_);
+                pending_ = false;
+                running_ = true;
+            }
+            job();
+            {
+                std::lock_guard lock(mutex_);
+                running_ = false;
+            }
+            done_.notify_all();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::condition_variable done_;
+    std::function<void()> job_;
+    bool pending_{};
+    bool running_{};
+    bool stop_{};
+    std::thread thread_;
+};
+
+GlThread &gl_thread() {
+    static GlThread thread;
+    return thread;
+}
+
+}  // namespace
+
+void stop_gl_thread() noexcept { gl_thread().stop(); }
+
+namespace {
+
+// Moves the accumulated frame into `job`; GlState keeps the job's old
+// (emptied) vectors to fill next.
+void hand_over_frame(GlState &s, FrameJob &job, std::uint64_t vblank, bool publish) {
+    job.vertices.clear();
+    job.indices.clear();
+    job.batches.clear();
+    std::swap(job.vertices, s.vertices);
+    std::swap(job.indices, s.indices);
+    std::swap(job.batches, s.batches);
+    job.epoch = s.frame_epoch;
+    job.vblank = vblank;
+    job.display_framebuffer = s.display_framebuffer;
+    job.publish = publish;
+    job.display = nullptr;
+    job.draws = 0u;
+    job.touched_display = job.presented = job.read_back = false;
+    job.feedback_draws = job.snapshots = 0u;
+    ++s.frame_epoch;
+}
+
+void run_frame_job(GlState &s, FrameJob &job) {
+    ContextScope scope(s);
+    if (!scope.ok()) {
+        static std::uint64_t failures = 0u;
+        if (++failures <= 5u) std::cerr << "[gl] could not make the context current: " << SDL_GetError() << "\n";
+        return;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> guard(s.mutex);
+        plan_frame(s, job);
+    }
+    draw_frame(s, job);
+    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+    report_frame(s, job);
+}
+
+}  // namespace
+
+bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+    GlState &s = state();
+    const bool threaded = gl_thread_enabled();
+    // The previous frame must be off GlState's hands before this one is
+    // handed over; it is waited for without s.mutex (the GL thread takes it).
+    if (threaded) gl_thread().wait_idle();
+    std::unique_lock<std::recursive_mutex> guard(s.mutex);
+    const bool publish = ge_finish_shows_this_frame();
+    const auto drop_frame = [&]() {
+        s.vertices.clear();
+        s.indices.clear();
+        s.batches.clear();
+        ++s.frame_epoch;
+    };
+    if (!s.enabled || s.batches.empty()) {
+        drop_frame();
+        return false;
+    }
+    const std::size_t vertex_bytes = s.vertices.size() * sizeof(UploadVertex);
+    const std::size_t index_bytes = s.indices.size() * sizeof(std::uint32_t);
+    if (vertex_bytes + index_bytes > kGeometryUploadCapacity) {
+        ++s.report.game_vertex_overflows;
+        drop_frame();
+        return false;
+    }
+    if (!threaded) {
+        static FrameJob job;
+        hand_over_frame(s, job, vblank, publish);
+        run_frame_job(s, job);
+        return job.presented || job.read_back;
+    }
+    FrameJob &job = gl_thread().frame;
+    hand_over_frame(s, job, vblank, publish);
+    // What the caller is told: whether this frame draws into the displayed
+    // target and will be shown. The GL thread finds out for certain later;
+    // a readback caller wants the pixels now, so it waits.
+    bool expected = false;
+    if (publish) {
+        for (const Batch &batch : job.batches) {
+            if ((batch.draw.framebuffer_address & 0x001FFFF0u) == job.display_framebuffer) {
+                expected = true;
+                break;
+            }
+        }
+    }
+    const bool readback = s.readback_mode;
+    if (expected && !readback) s.direct_present_ok = true;
+    guard.unlock();
+    gl_thread().post([&s, &job] { run_frame_job(s, job); }, readback);
+    if (readback) return job.presented || job.read_back;
+    return expected;
 }
 
 bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte> destination) noexcept {
@@ -2407,9 +2539,21 @@ static bool gl_guest_present_available() noexcept {
     return s.enabled && !s.readback_mode;
 }
 
-// A CPU-made frame (videos, the software path's picture) shown in the window.
+static bool gl_present_guest_rgba_here(std::span<const std::byte> rgba, std::uint32_t width,
+                                       std::uint32_t height) noexcept;
+
+// A CPU-made frame (videos, the software path's picture) shown in the window,
+// on the GL thread when there is one (the caller waits: `rgba` is borrowed).
 static bool gl_present_guest_rgba(std::span<const std::byte> rgba, std::uint32_t width,
                                   std::uint32_t height) noexcept {
+    if (!gl_thread_enabled()) return gl_present_guest_rgba_here(rgba, width, height);
+    bool presented = false;
+    gl_thread().post([&] { presented = gl_present_guest_rgba_here(rgba, width, height); }, true);
+    return presented;
+}
+
+static bool gl_present_guest_rgba_here(std::span<const std::byte> rgba, std::uint32_t width,
+                                       std::uint32_t height) noexcept {
     GlState &s = state();
     std::lock_guard<std::recursive_mutex> guard(s.mutex);
     if (!s.enabled || s.readback_mode) return false;

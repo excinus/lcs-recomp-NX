@@ -87,9 +87,18 @@ Small `__SWITCH__` changes in shared code:
   the game's logo. The OpenGL and SDL presenters show it over the frame; the
   others keep the text panel.
 - `lcs_ge_exec.cpp`: block transfers (`TRXKICK`, 0xEA) copy their rectangle
-  in guest memory. When the game loads without vblank (`present_if_stalled`)
-  and a transfer wrote into the displayed buffer, that buffer is shown; the
-  log also lists every draw of that frame (`[gl]` lines) and the transfers.
+  in guest memory.
+- `ge_gpu_backend_gl.cpp`: a GL thread. The GE worker hands each finished
+  frame over (its vertices, indices and draws) and decodes the next one while
+  the GL thread uploads it, draws it and swaps; one frame in flight. The
+  driver's share (submissions, buffer copies, waits, the draw loop) was about
+  a third of the GE worker's time. Planning (textures, targets, uniforms)
+  runs under the backend's lock, the draws without it; every GL call is on
+  that thread, the guest-frame present included. Switch default,
+  `LCS_GL_THREAD=0` / `1`. Vertices grow without being initialised first.
+- Threads: the GE worker has core 1 to itself (see "Start-up and threads").
+- The island loading-card experiments are gone (stalled presents, frame
+  dumps, list digests): the PC port shows no card either.
 - `lcs_profile.cpp`: with `LCS_GE_OVERLAP=1`, `sceGeListEnQueue` does not
   wait for the GE worker to go idle (at most four lists queued); the game
   waits in `sceGeDrawSync`, as on a PSP, and a list's finish callback waits
@@ -101,27 +110,15 @@ Small `__SWITCH__` changes in shared code:
   of buffers in turn, each kept at its size (`glBufferSubData`); a new
   `glBufferData` size every frame made the Switch's driver allocate and map
   megabytes of fresh memory per frame. `LCS_GL_UPLOAD_RING=0` restores it.
-- The mixer dropped about six blocks a second on the console even at a
-  steady 30 fps, which fits a game clock some 7% fast (CPU-time ticks
-  carrying a frame past the vblank it is paced to), making sound faster than
-  the device plays it. Ticks now stop while the guest clock is ahead of real
-  time (Switch default; `LCS_GUEST_CLOCK_CLAMP=0` off) and `[watch]` shows
-  `guest clock N%` (100% is right). The mixer's headroom over the prebuffer is a third of it (4
-  blocks at the Switch's 12) instead of 2.
-- Island loading card: stalled presents now also log who queued the lists
-  (guest thread names, `[thread]` lines at creation), how many came from the
-  vblank interrupt, the draws per render target, every 2D draw with a large
-  texture and the last draws, and save the frame the GPU drew as
-  `stallN_gpu.bmp`. Lists queued from the vblank interrupt, otherwise only
-  scanned, are drawn while the game is stalled (`LCS_STALL_VBLANK_LISTS=0`
-  off).
+- CPU-time ticks no longer carry the guest clock ahead of real time (Switch
+  default; `LCS_GUEST_CLOCK_CLAMP=0` off); `[watch]` shows `guest clock N%`
+  (100% is right). The mixer's headroom over the prebuffer is a third of it
+  (4 blocks at the Switch's 12) instead of 2.
 - `ge_gpu_backend_gl.cpp`: per-draw uniforms go in arrays of 341 blocks per
   64 KiB range; each draw finds its block through an instanced attribute and
   its base instance (GL 4.2), so the range is bound once per 341 draws, not
   per draw (each bind made nouveau re-emit the constant buffer).
   `LCS_GL_BATCHED_UNIFORMS=0` goes back to a range per draw.
-- Stalled presents also log the lists' primitives and save the displayed and
-  render-target buffers as `stallN_display.bmp` / `stallN_target.bmp`.
 - `[watch]` lines count audio gaps (queue ran dry) and skips (blocks dropped
   over the latency limit).
 - `lcs_savedata_crypto.cpp`: reads saves a PSP or PPSSPP encrypted
@@ -152,13 +149,9 @@ Small `__SWITCH__` changes in shared code:
   ZL / ZR follow `Triggers` (d-pad left/right by default).
 - `lcs_key_bindings.hpp`: a trigger keeps its buttons in a vehicle unless it
   also accelerates or brakes (so ZL / ZR change the radio station).
-- `lcs_profile.cpp`: frames are shown when the game waits for vblank. Between
-  islands it draws the "Welcome to..." card and then loads for seconds without
-  waiting, so the window kept the last street frame; file reads now present
-  what was drawn or flipped once 300 ms pass without a vblank wait. With the
-  GPU presenting directly, a frame the game drew itself (no GE frame) is read
-  from the buffer it displays, not from the last GE target, whose memory the
-  GPU never wrote.
+- `lcs_profile.cpp`: with the GPU presenting directly, a frame the game drew
+  itself (no GE frame) is read from the buffer it displays, not from the last
+  GE target, whose memory the GPU never wrote.
 - `ge_gpu_backend_gl.cpp`: the packed 0115 vertices go straight into the
   upload buffer.
 - Audio: the sound queue is 12 blocks (139 ms) instead of 6, so slow frames do
@@ -191,10 +184,13 @@ Small `__SWITCH__` changes in shared code:
 7. Runs the PC `main()` on a thread with a 64 MiB stack (Windows links with
    `/STACK:67108864`) pinned to core 0, with `--game /switch/LCSNative/game`.
 
-Every other thread goes through `__wrap_pthread_create` and is placed on cores
-1 and 2 (alternating ideal core, affinity mask 1|2). Horizon starts new threads
-on the process's default core and never moves them, so without this the GE
-worker and raster workers would share core 0 with the game. Each gets at least
+Every other thread goes through `__wrap_pthread_create` and is placed on core
+2; the GE worker then moves itself to core 1, which it has alone. Core 2
+holds the GL thread, draw decoding, the raster helper, sound and the profiler.
+Horizon starts new threads on the process's default core and does not
+time-slice equal priorities, so threads that share a core take turns: the old
+layout (alternating cores 1 and 2 in creation order) put the draw-decode
+worker on the GE worker's core. Each gets at least
 8 MiB of stack (Linux's default, which the PC code assumes; libnx's is much
 smaller). Defaults: two raster participants (the GE thread and one worker), no
 extra decode threads.

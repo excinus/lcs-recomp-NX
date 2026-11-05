@@ -11,7 +11,8 @@
 //  3. It checks that game/EBOOT.ELF is there, and if not shows what to do.
 //  4. It runs the PC main() on a thread with a 64 MiB stack pinned to core 0.
 //
-// --wrap=pthread_create puts every other thread on cores 1 and 2.
+// --wrap=pthread_create puts every other thread on core 2; the GE worker
+// moves itself to core 1, which it then has alone.
 //
 // Clocks are the player's business (sys-clk, Ultrahand): the game leaves them
 // alone.
@@ -65,9 +66,20 @@ constexpr const char *kPreviousLogName = "lcs_log_prev.txt";
 constexpr const char *kEnvName = "lcs_env.txt";
 constexpr std::size_t kGameStackBytes = 64u * 1024u * 1024u;
 
-// Cores an application may use. Core 3 belongs to the system.
-constexpr u32 kGameCoreMask = 1u << 0;
-constexpr u32 kWorkerCoreMask = (1u << 1) | (1u << 2);
+// Cores an application may use. Core 3 belongs to the system. The game and
+// the GE worker are the two busy threads (the [watch] line shows each near a
+// full core); each gets a core of its own. Everything else (draw decoding,
+// the raster helper, sound, the profiler, Mesa's threads) shares core 2.
+// Threads used to alternate between cores 1 and 2 in creation order, which
+// put the draw-decode worker on the GE worker's core: Horizon does not
+// time-slice equal priorities, so they took turns instead of running side
+// by side.
+constexpr s32 kGameCore = 0;
+constexpr s32 kGeCore = 1;
+constexpr s32 kWorkerCore = 2;
+constexpr u32 kGameCoreMask = 1u << kGameCore;
+constexpr u32 kGeCoreMask = 1u << kGeCore;
+constexpr u32 kWorkerCoreMask = 1u << kWorkerCore;
 
 std::string g_base_dir;  // "/switch/LCSNative": no "sdmc:" so std::filesystem sees it as absolute
 
@@ -549,7 +561,7 @@ struct GameThreadArgs {
 
 void *game_thread_main(void *param) {
     auto *args = static_cast<GameThreadArgs *>(param);
-    svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, kGameCoreMask);
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, kGameCore, kGameCoreMask);
     track_current_thread("game");
     args->result = __real_main(args->argc, args->argv);
     return nullptr;
@@ -558,7 +570,6 @@ void *game_thread_main(void *param) {
 struct ThreadStart {
     void *(*routine)(void *);
     void *arg;
-    s32 core;
     unsigned index;
     bool tracked;
 };
@@ -569,7 +580,7 @@ std::atomic<unsigned> g_threads_started{0};
 void *worker_thread_main(void *param) {
     ThreadStart start = *static_cast<ThreadStart *>(param);
     delete static_cast<ThreadStart *>(param);
-    svcSetThreadCoreMask(CUR_THREAD_HANDLE, start.core, kWorkerCoreMask);
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, kWorkerCore, kWorkerCoreMask);
     char name[16];
     std::snprintf(name, sizeof(name), "t%u", static_cast<unsigned>(start.index));
     if (start.tracked) track_current_thread(name);
@@ -592,8 +603,7 @@ extern "C" int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *at
     pthread_attr_getstacksize(&sized, &stack);
     if (stack < kMinThreadStackBytes) pthread_attr_setstacksize(&sized, kMinThreadStackBytes);
     const unsigned index = g_threads_started.fetch_add(1);
-    auto *start = new ThreadStart{start_routine, arg, 1 + static_cast<s32>(index % 2u), index,
-                                  !t_untracked_spawn};
+    auto *start = new ThreadStart{start_routine, arg, index, !t_untracked_spawn};
     const int result = __real_pthread_create(thread, &sized, worker_thread_main, start);
     if (result != 0) delete start;
     return result;
@@ -601,6 +611,7 @@ extern "C" int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *at
 
 extern "C" void lcs_switch_name_current_thread(const char *name) {
     const Handle self = threadGetCurHandle();
+    if (std::strcmp(name, "ge") == 0) svcSetThreadCoreMask(CUR_THREAD_HANDLE, kGeCore, kGeCoreMask);
     {
         std::lock_guard<std::mutex> guard(g_tracked_mutex);
         for (std::size_t index = 0u; index < g_tracked_count.load(); ++index) {

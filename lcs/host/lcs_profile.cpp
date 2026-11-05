@@ -1957,9 +1957,6 @@ struct PresentRequest {
     std::uint32_t display_height{};
     std::uint32_t game_width{};
     std::uint32_t game_height{};
-    // Sent from file I/O while the game loads without waiting for vblank:
-    // show what it drew last, even a frame it drew itself.
-    bool stalled{false};
 };
 
 void cap_frame_rate(std::uint32_t list_address) {
@@ -1999,44 +1996,6 @@ void execute_ge_list_frame(psprecomp::Runtime &rt, std::uint32_t list_address, s
     g_ge_last_list_address = list_address;
 }
 
-// A guest framebuffer as a 24-bit BMP, for the stalled-frame report.
-void dump_guest_framebuffer(psprecomp::Runtime &rt, std::uint32_t address, std::uint32_t stride,
-                            std::uint32_t format, const std::string &name) {
-    constexpr std::uint32_t kWidth = 480u, kHeight = 272u;
-    const std::uint32_t bytes_per_pixel = format == 3u ? 4u : 2u;
-    if (address == 0u || stride < kWidth) return;
-    const std::uint8_t *source = rt.memory().raw_pointer(address, static_cast<std::size_t>(stride) * kHeight * bytes_per_pixel);
-    if (source == nullptr) return;
-    const std::uint32_t row_bytes = kWidth * 3u;
-    const std::uint32_t image_bytes = row_bytes * kHeight;
-    std::vector<std::uint8_t> file(54u + image_bytes, 0u);
-    const auto put32 = [&](std::size_t at, std::uint32_t value) {
-        for (int index = 0; index < 4; ++index) file[at + index] = static_cast<std::uint8_t>(value >> (8 * index));
-    };
-    file[0] = 'B'; file[1] = 'M';
-    put32(2, static_cast<std::uint32_t>(file.size())); put32(10, 54u); put32(14, 40u);
-    put32(18, kWidth); put32(22, kHeight); file[26] = 1; file[28] = 24; put32(34, image_bytes);
-    for (std::uint32_t y = 0; y < kHeight; ++y) {
-        std::uint8_t *out = file.data() + 54u + static_cast<std::size_t>(kHeight - 1u - y) * row_bytes;
-        for (std::uint32_t x = 0; x < kWidth; ++x) {
-            const std::uint8_t *p = source + (static_cast<std::size_t>(y) * stride + x) * bytes_per_pixel;
-            std::uint32_t r = 0, g = 0, b = 0;
-            if (format == 3u) { r = p[0]; g = p[1]; b = p[2]; }
-            else {
-                const std::uint32_t v = p[0] | (p[1] << 8u);
-                if (format == 0u) { r = (v & 31u) << 3u; g = ((v >> 5u) & 63u) << 2u; b = ((v >> 11u) & 31u) << 3u; }
-                else if (format == 1u) { r = (v & 31u) << 3u; g = ((v >> 5u) & 31u) << 3u; b = ((v >> 10u) & 31u) << 3u; }
-                else { r = (v & 15u) << 4u; g = ((v >> 4u) & 15u) << 4u; b = ((v >> 8u) & 15u) << 4u; }
-            }
-            out[x * 3u + 0u] = static_cast<std::uint8_t>(b);
-            out[x * 3u + 1u] = static_cast<std::uint8_t>(g);
-            out[x * 3u + 2u] = static_cast<std::uint8_t>(r);
-        }
-    }
-    std::ofstream output(name, std::ios::binary | std::ios::trunc);
-    if (output) output.write(reinterpret_cast<const char *>(file.data()), static_cast<std::streamsize>(file.size()));
-}
-
 void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
     std::uint32_t present_buffer = request.display_buffer;
     std::uint32_t present_stride = request.display_stride;
@@ -2070,45 +2029,9 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
 
     bool presented_gpu_frame = false;
     static bool showing_guest_frame = false;
-    // A picture the GE copied into the displayed buffer (TRXKICK) is only in
-    // guest memory: the GPU targets never see it.
-    const GeBlockTransfers transfers = ge_block_transfers_take();
-    const std::uint32_t display_bytes = request.display_stride * 4u * std::max(request.display_height, 272u);
-    const bool transfer_to_display = transfers.count != 0u && request.display_buffer != 0u &&
-        (transfers.last_destination & 0x0FFFFFFFu) >= (request.display_buffer & 0x0FFFFFFFu) &&
-        (transfers.last_destination & 0x0FFFFFFFu) < (request.display_buffer & 0x0FFFFFFFu) + display_bytes;
-    const GeListDigest digest = ge_list_digest_take();
-    if (request.stalled) {
-        std::cout << "[present] stalled lists: " << digest.primitives << " primitives (by type";
-        for (std::uint32_t count : digest.by_type) std::cout << " " << count;
-        std::cout << "), render target 0x" << std::hex << render_target << std::dec << " stride " << render_stride << "\n";
-        for (std::size_t index = 0; index < digest.recorded; ++index) {
-            const GeListDigest::Primitive &p = digest.first[index];
-            std::cout << "[present]   prim " << p.type << " n=" << p.count << " vtype=0x" << std::hex << p.vertex_type
-                      << " fb=0x" << p.framebuffer << " tex=" << (p.textured ? "on" : "off") << " fmt=" << std::dec
-                      << p.texture_format << " 0x" << std::hex << p.texture << std::dec
-                      << (p.clear ? " clear" : "") << "\n";
-        }
-        static int dumps = 0;
-        if (dumps < 12) {
-            ++dumps;
-            const std::string stem = "stall" + std::to_string(dumps);
-            dump_guest_framebuffer(rt, request.display_buffer, request.display_stride, request.pixel_format,
-                                   stem + "_display.bmp");
-            if (render_target != 0u && render_target != request.display_buffer)
-                dump_guest_framebuffer(rt, render_target, render_stride, request.pixel_format, stem + "_target.bmp");
-            std::cout << "[present]   saved " << stem << "_display.bmp / _target.bmp (format "
-                      << request.pixel_format << ")\n";
-        }
-        std::cout << "[present] stalled frame: gpu_frame=" << gpu_frame_ready << " transfers=" << transfers.count
-                  << " last_to=0x" << std::hex << transfers.last_destination << std::dec << " "
-                  << transfers.last_width << "x" << transfers.last_height
-                  << " into_display=" << transfer_to_display << "\n" << std::flush;
-    }
     if (ge_gpu_backend_presents_directly()) {
-        const bool show_guest = (request.stalled && transfer_to_display) ||
-                                (!gpu_frame_ready && (request.stalled || !holding_gpu_frame) &&
-                                 ge_gpu_backend_guest_present_available());
+        const bool show_guest = !gpu_frame_ready && !holding_gpu_frame &&
+                                ge_gpu_backend_guest_present_available();
         if (!show_guest) {
             ge_gpu_backend_mark_window_presented();
             presented_gpu_frame = true;
@@ -2145,7 +2068,7 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
     if (!presented_gpu_frame) {
         if (ge_gpu_backend_presents_directly()) {
             // No GPU frame for a while: the game is drawing the screen itself
-            // (the loading screens between islands). Its picture is in the
+            // (videos, loads). Its picture is in the
             // buffer it displays. The last GE target's memory is not written
             // when the GPU renders, so it holds an old, broken image.
             if (!showing_guest_frame) {
@@ -2162,7 +2085,7 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
     }
 }
 
-PresentRequest make_present_request(const psprecomp::Runtime &rt, bool stalled) {
+PresentRequest make_present_request(const psprecomp::Runtime &rt) {
     PresentRequest request{};
     request.vblank = display_vblank_index;
     request.display_buffer = display_state.frame_buffer;
@@ -2174,80 +2097,19 @@ PresentRequest make_present_request(const psprecomp::Runtime &rt, bool stalled) 
         request.game_width = rt.memory().load32(kGameRenderWidthAddress);
         request.game_height = rt.memory().load32(kGameRenderWidthAddress + 4u);
     }
-    request.stalled = stalled;
     return request;
 }
 
-// What the window last got, for present_if_stalled.
-std::chrono::steady_clock::time_point last_present_wall{};
-std::uint32_t last_present_framebuffer{};
-std::uint64_t ge_lists_since_present{};
-// For the stalled-frame report: who queued the lists since the last present.
-std::map<std::string, std::uint32_t> list_threads_since_present;
-std::uint32_t vblank_lists_since_present{};
-std::uint32_t vblank_lists_run_since_present{};
-
-// The game has shown nothing for a while (it loads without waiting for vblank).
-bool loading_stall_active() {
-    return last_present_wall.time_since_epoch().count() != 0 &&
-           std::chrono::steady_clock::now() - last_present_wall >= std::chrono::milliseconds(300);
-}
-
-// Lists queued from the vblank interrupt are not drawn while the game runs
-// (the frames come from its own lists); during a load they are, in case the
-// interrupt draws the loading card. LCS_STALL_VBLANK_LISTS=0 turns it off.
-bool run_vblank_lists_when_stalled() {
-    static const bool enabled = [] {
-        const char *text = std::getenv("LCS_STALL_VBLANK_LISTS");
-        return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
-    }();
-    return enabled;
-}
-
-void submit_present(psprecomp::Runtime &rt, const PresentRequest &request, bool always = false) {
-    last_present_wall = std::chrono::steady_clock::now();
-    last_present_framebuffer = request.display_buffer;
-    ge_lists_since_present = 0u;
-    list_threads_since_present.clear();
-    vblank_lists_since_present = 0u;
-    vblank_lists_run_since_present = 0u;
+void submit_present(psprecomp::Runtime &rt, const PresentRequest &request) {
     if (!ge_async_enabled()) {
         present_frame(rt, request);
-    } else if (always || ge_worker.pending_presents.load() == 0u) {
+    } else if (ge_worker.pending_presents.load() == 0u) {
         ge_worker.pending_presents.fetch_add(1u);
         ge_worker_submit([&rt, request] {
             present_frame(rt, request);
             ge_worker.pending_presents.fetch_sub(1u);
         });
     }
-}
-
-// The game shows frames only when it waits for vblank. Between islands it
-// draws the "Welcome to..." card, sets it as the display buffer and then
-// loads for a few seconds without waiting for vblank; a PSP's display shows
-// the card all along, the window kept the last street frame. File reads call
-// this: once the game has gone 300 ms without a vblank wait (longer than any
-// slow frame, so a frame still being drawn is not shown) and has drawn or
-// flipped since the last present, that picture is presented.
-void present_if_stalled(psprecomp::Runtime &rt) {
-    if (last_present_wall.time_since_epoch().count() == 0) return;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last_present_wall < std::chrono::milliseconds(300)) return;
-    if (ge_lists_since_present == 0u && display_state.frame_buffer == last_present_framebuffer) return;
-    static std::uint64_t logged = 0u;
-    if (logged++ < 20u) {
-        std::cout << "[present] loading without vblank: showing frame 0x" << std::hex
-                  << display_state.frame_buffer << std::dec << " (" << ge_lists_since_present
-                  << " lists; from vblank interrupt " << vblank_lists_since_present << ", drawn "
-                  << vblank_lists_run_since_present << "; by thread";
-        for (const auto &[name, count] : list_threads_since_present) std::cout << " \"" << name << "\" " << count;
-        const auto current = thread_table.threads.find(thread_table.current_uid);
-        std::cout << "; now in \"" << (current != thread_table.threads.end() ? current->second.name : "?")
-                  << "\")\n" << std::flush;
-    }
-    ge_gpu_describe_next_frame().store(true);
-    submit_present(rt, make_present_request(rt, true), true);
-    display_window_pump();
 }
 
 void check_wall_clock_limit(psprecomp::Runtime &runtime, std::uint64_t sample_mask) {
@@ -2264,9 +2126,7 @@ void check_wall_clock_limit(psprecomp::Runtime &runtime, std::uint64_t sample_ma
 // waits (paced to real time), thread delays and, while code runs, a tick per
 // few hundred dispatched blocks (an estimate of CPU time). When a frame's
 // ticks pass the next vblank, the wait ends a vblank later in game time than
-// in real time. On the Switch the mixer dropped about six blocks a second at
-// a steady 30 fps, which fits a game clock some 7% fast (its sound outruns
-// the device). With the clamp (Switch default, LCS_GUEST_CLOCK_CLAMP=0 turns
+// in real time. With the clamp (Switch default, LCS_GUEST_CLOCK_CLAMP=0 turns
 // it off), ticks stop while the guest clock is ahead of the real one; the
 // [watch] line shows the ratio.
 struct GuestClockAnchor {
@@ -2502,10 +2362,6 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 ctx.gpr[8],
             };
             const std::int32_t uid = thread_table.next_uid++;
-            static int created_logged = 0;
-            if (created_logged++ < 48)
-                std::cout << "[thread] " << uid << " \"" << name << "\" priority " << ctx.gpr[6] << " entry 0x"
-                          << std::hex << ctx.gpr[5] << std::dec << "\n";
             record.stack_top = stack_top;
             record.stack_bottom = stack_bottom;
             record.kernel_context = stack_top - 0x100u;
@@ -3324,7 +3180,6 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
 
     runtime.register_hle("IoFileMgrForUser", 0x109F50BCu,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
-            present_if_stalled(rt);
             const std::string path = rt.memory().read_c_string(ctx.gpr[4]);
             // Reject write/create/truncate/append before opening any native path.
             if (stress_test_enabled() && (ctx.gpr[5] & (0x0002u | 0x0100u | 0x0200u | 0x0400u)) != 0u) {
@@ -3396,7 +3251,6 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
 
     runtime.register_hle("IoFileMgrForUser", 0x6A638D83u,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
-            present_if_stalled(rt);
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint32_t dst = ctx.gpr[5];
             std::uint32_t size = ctx.gpr[6];
@@ -3476,7 +3330,6 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
 
     runtime.register_hle("IoFileMgrForUser", 0x27EB27B8u,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
-            present_if_stalled(rt);
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint64_t raw_offset = static_cast<std::uint64_t>(ctx.gpr[6]) |
                 (static_cast<std::uint64_t>(ctx.gpr[7]) << 32u);
@@ -3730,7 +3583,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     auto wait_vblank = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
         ++display_vblank_index;
         check_wall_clock_limit(rt, 0x3Fu);
-        submit_present(rt, make_present_request(rt, false));
+        submit_present(rt, make_present_request(rt));
         display_window_pump();
         if (display_window_closed()) {
             ge_worker_wait_idle();
@@ -3759,16 +3612,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     runtime.register_hle("sceGe_user", 0xAB49E76Au,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const std::uint32_t list_address = ctx.gpr[4];
-            const bool interrupt_list = in_vblank_interrupt();
-            if (!interrupt_list) cap_frame_rate(list_address);
-            ++ge_lists_since_present;
-            if (const auto thread = thread_table.threads.find(thread_table.current_uid);
-                thread != thread_table.threads.end())
-                ++list_threads_since_present[interrupt_list ? thread->second.name + " (vblank)" : thread->second.name];
-            if (interrupt_list) ++vblank_lists_since_present;
-            const bool from_vblank =
-                interrupt_list && !(run_vblank_lists_when_stalled() && loading_stall_active());
-            if (interrupt_list && !from_vblank) ++vblank_lists_run_since_present;
+            const bool from_vblank = in_vblank_interrupt();
+            if (!from_vblank) cap_frame_rate(list_address);
             bool list_finished = false;
             std::uint32_t finish_argument = 0u;
             std::uint64_t worker_task = 0u;

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -413,13 +412,6 @@ inline bool &ge_finish_shows_this_frame() noexcept {
     std::span<std::byte> destination) noexcept;
 
 [[nodiscard]] bool ge_gpu_backend_presents_directly() noexcept;
-
-// Set to have the backend log every draw of the next finished frame (the
-// frame shown while the game loads without vblank). The OpenGL backend reads it.
-inline std::atomic<bool> &ge_gpu_describe_next_frame() noexcept {
-    static std::atomic<bool> flag{false};
-    return flag;
-}
 
 // Empty until a backend that can show a guest frame assigns it.
 struct GeGuestPresent {
