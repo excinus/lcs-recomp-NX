@@ -158,6 +158,7 @@ add_executable(lcs_host_menu_test
     ${CMAKE_SOURCE_DIR}/tests/lcs_host_menu_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_display_menu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_save_picker.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_savedata_crypto.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_render_config.cpp)
 target_include_directories(lcs_host_menu_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/host
@@ -168,7 +169,7 @@ else()
     target_link_libraries(lcs_host_menu_test PRIVATE PkgConfig::SDL2 Threads::Threads)
 endif()
 if(PSPRECOMP_BUILD_TESTS)
-    foreach(_mode menu present f10 bindings fps persist triggers saves)
+    foreach(_mode menu present f10 bindings fps persist triggers saves crypto)
         add_test(NAME lcs_host_menu_${_mode} COMMAND lcs_host_menu_test ${_mode})
     endforeach()
 endif()
@@ -193,6 +194,7 @@ if(PSPRECOMP_BUILD_TESTS)
             host/lcs_render_config.cpp
             host/lcs_display_menu.cpp
             host/lcs_save_picker.cpp
+            host/lcs_savedata_crypto.cpp
             host/lcs_runtime_log.cpp)
         target_compile_definitions(lcs_ge_gl_backend_test PRIVATE LCS_GL_GE_BACKEND=1)
         target_include_directories(lcs_ge_gl_backend_test PRIVATE host ${CMAKE_SOURCE_DIR}/include)

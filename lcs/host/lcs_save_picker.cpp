@@ -1,6 +1,7 @@
 #include "lcs_save_picker.hpp"
 
 #include "lcs_render_config.hpp"
+#include "lcs_savedata_crypto.hpp"
 
 #include <sys/stat.h>
 
@@ -65,21 +66,6 @@ std::vector<std::uint8_t> read_file(const std::filesystem::path &path, std::size
     return bytes;
 }
 
-// A PSP-encrypted DATA.BIN is noise; the game's own data is not (its saves
-// are mostly zeros and small numbers).
-bool looks_encrypted(const std::vector<std::uint8_t> &head) {
-    if (head.size() < 1024u) return false;
-    std::size_t counts[256]{};
-    for (std::uint8_t byte : head) ++counts[byte];
-    double entropy = 0.0;
-    for (std::size_t count : counts) {
-        if (count == 0u) continue;
-        const double p = static_cast<double>(count) / static_cast<double>(head.size());
-        entropy -= p * std::log2(p);
-    }
-    return entropy > 7.0;
-}
-
 std::string first_line(const std::string &text) {
     std::string line = text.substr(0, text.find_first_of("\r\n"));
     while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
@@ -124,16 +110,13 @@ void fill_details(SaveSlot &slot) {
         }
     }
     if (!slot.exists) return;
-    bool crypt_known = false;
     if (const auto sfo = parse_save_sfo(read_file(slot.directory / "PARAM.SFO", 64u * 1024u))) {
         slot.title = printable(sfo->savedata_title.empty() ? sfo->title : sfo->savedata_title);
         slot.detail = printable(first_line(sfo->detail));
-        if (sfo->crypt_mode) {
-            slot.encrypted = *sfo->crypt_mode != 0u;
-            crypt_known = true;
-        }
     }
-    if (!crypt_known) slot.encrypted = looks_encrypted(read_file(data, 16u * 1024u));
+    // The file decides, not PARAM.SFO: a save decrypted with a PC tool keeps
+    // the PSP's PARAM.SFO, which still says encrypted.
+    slot.encrypted = savedata_looks_encrypted(read_file(data, 16u * 1024u));
 }
 
 bool is_lcs_release(const std::filesystem::path &directory, const std::string &game_id) {
@@ -182,11 +165,6 @@ void choose(PickerState &state) {
     }
     const SaveSlot &slot = state.slots[static_cast<std::size_t>(state.selected)];
     if (state.mode == SavePickerMode::Load) {
-        if (slot.encrypted) {
-            std::snprintf(state.question, sizeof(state.question), "MADE ON A PSP: ENCRYPTED, CANNOT LOAD");
-            state.stage = Stage::Message;
-            return;
-        }
         if (slot.foreign) {
             std::snprintf(state.question, sizeof(state.question), "%s SAVE: MAY NOT WORK. LOAD?",
                           region_of(slot.game_id));
@@ -410,7 +388,6 @@ HostSettingsView save_picker_view() noexcept {
         if (slot.foreign) text += " " + std::string(region_of(slot.game_id));
         text.resize(std::max<std::size_t>(text.size(), 11u), ' ');
         if (!slot.exists) text += "NEW SAVE";
-        else if (slot.encrypted) text += "ENCRYPTED (PSP)";
         else if (!slot.detail.empty()) text += slot.detail;
         else if (!slot.title.empty()) text += slot.title;
         else text += slot.when;

@@ -43,8 +43,9 @@ Saves
 Saves live in sdmc:/switch/LCSNative/game/PSP/SAVEDATA/ (one folder per save,
 as on the PSP). "Load game" and saving show the save list: A picks, B goes
 back. Saves from the game's other releases (EU, JP...) are listed too, marked
-with their region; they may not work with this one. Saves made on a real PSP
-are encrypted and cannot be read yet.
+with their region; they may not work with this one. Saves from a PSP or from
+PPSSPP are encrypted: they are decrypted when loaded, with the key the game
+itself uses (a save of another release may use another key).
 
 Speed
 -----

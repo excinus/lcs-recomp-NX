@@ -14,6 +14,7 @@
 #include "lcs_menu.hpp"
 #include "lcs_render_config.hpp"
 #include "lcs_save_picker.hpp"
+#include "lcs_savedata_crypto.hpp"
 #include "lcs_stress_test.hpp"
 #include "lcs_switch_hooks.hpp"
 #include "lcs_world_detail.hpp"
@@ -786,6 +787,8 @@ constexpr std::uint32_t kSavedataSfoSavedataTitleOffset = 0x100u;
 constexpr std::uint32_t kSavedataSfoDetailOffset = 0x180u;
 constexpr std::uint32_t kSavedataSfoParentalOffset = 0x580u;
 constexpr std::uint32_t kSavedataFocusOffset = 0x5C8u;
+constexpr std::uint32_t kSavedataKeyOffset = 0x5DCu;
+constexpr std::uint32_t kSavedataLoadBroken = 0x80110326u;  // LOAD_DATA_BROKEN
 constexpr std::uint32_t kUtilityResultCancel = 1u;  // SCE_UTILITY_DIALOG_RESULT_CANCEL
 constexpr std::uint32_t kSavedataFileNameOffset = 0x64u;
 constexpr std::uint32_t kSavedataDataBufferOffset = 0x74u;
@@ -866,14 +869,48 @@ std::uint32_t load_savedata_file(psprecomp::Runtime &runtime, std::uint32_t para
     const auto file_size = static_cast<std::uint64_t>(end);
     const std::uint32_t destination = runtime.memory().load32(parameter_address + kSavedataDataBufferOffset);
     const std::uint32_t capacity = runtime.memory().load32(parameter_address + kSavedataDataBufferSizeOffset);
-    if (file_size > capacity || file_size > 0xFFFFFFFFull ||
-        (file_size != 0u && (destination == 0u || !runtime.memory().contains(destination, static_cast<std::size_t>(file_size))))) {
+    // An encrypted file is 16 bytes longer than its data: check the size again below.
+    if (file_size > static_cast<std::uint64_t>(capacity) + 16u || file_size > 0xFFFFFFFFull) {
         return raw_mode ? 0x80110328u : 0x80110308u;
     }
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(file_size));
     input.seekg(0, std::ios::beg);
     if (!bytes.empty()) input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!input && !bytes.empty()) return 0x80110305u;
+    if (!raw_mode && savedata_looks_encrypted(bytes)) {
+        // Saved by a PSP or PPSSPP: decrypt it with the key the game gives
+        // the utility, in the scheme PARAM.SFO names (else try each).
+        std::array<std::uint8_t, 16> key{};
+        for (std::uint32_t index = 0u; index < 16u; ++index)
+            key[index] = runtime.memory().load8(parameter_address + kSavedataKeyOffset + index);
+        std::vector<int> modes{3, 5, 1};
+        std::ifstream sfo_input(path.parent_path() / "PARAM.SFO", std::ios::binary);
+        const std::vector<std::uint8_t> sfo_bytes((std::istreambuf_iterator<char>(sfo_input)), {});
+        if (const auto sfo = parse_save_sfo(sfo_bytes); sfo && sfo->crypt_mode) {
+            const int named = savedata_crypt_mode(*sfo->crypt_mode);
+            if (named != 0) modes.insert(modes.begin(), named);
+        }
+        bool decrypted = false;
+        for (const int mode : modes) {
+            auto plain = decrypt_psp_savedata(bytes, mode, key);
+            if (!plain || savedata_looks_encrypted(*plain)) continue;
+            std::cout << "[savedata] " << path.parent_path().filename().string() << ": decrypted (PSP mode "
+                      << mode << ")\n" << std::flush;
+            bytes = std::move(*plain);
+            decrypted = true;
+            break;
+        }
+        if (!decrypted) {
+            std::cout << "[savedata] " << path.parent_path().filename().string()
+                      << ": encrypted, and this game's key does not open it (another release's key?)\n"
+                      << std::flush;
+            return kSavedataLoadBroken;
+        }
+    }
+    if (bytes.size() > capacity ||
+        (!bytes.empty() && (destination == 0u || !runtime.memory().contains(destination, bytes.size())))) {
+        return raw_mode ? 0x80110328u : 0x80110308u;
+    }
     if (!bytes.empty()) runtime.memory().copy_in(destination, bytes);
     runtime.memory().store32(parameter_address + kSavedataDataSizeOffset, static_cast<std::uint32_t>(bytes.size()));
     return 0u;

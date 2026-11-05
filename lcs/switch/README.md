@@ -78,9 +78,15 @@ Small `__SWITCH__` changes in shared code:
   and writes the chosen slot into `saveName`. Saves of the game's other
   releases (EU, JP disc IDs, or a `PARAM.SFO` titled Liberty City) are listed
   for loading; they are read from their own folder and saved back under this
-  release's ID. PSP-encrypted saves (`SAVEDATA_PARAMS`, or a `DATA.BIN` that
-  is noise) are shown but refused. Saves now get a `PARAM.SFO`. Off on the PC
-  unless `LCS_SAVE_PICKER=1`.
+  release's ID. Saves now get a `PARAM.SFO`. Off on the PC unless
+  `LCS_SAVE_PICKER=1`.
+- `lcs_savedata_crypto.cpp`: reads saves a PSP or PPSSPP encrypted
+  (`SAVEDATA_PARAMS` 0x01/0x21/0x41, modes 1/3/5). Whether a `DATA.BIN` is
+  encrypted is decided by its bytes (near 8 bits of entropy), not by
+  PARAM.SFO, since a save decrypted on a PC keeps the PSP's PARAM.SFO. The
+  load decrypts with the key the game passes the utility (`key`, at 0x5DC)
+  and refuses with LOAD_DATA_BROKEN when the result is still noise. Saves are
+  written back plain. Own AES-128; checked against known answers.
 - `lcs_prompt_textures.cpp`: `ButtonPrompts=Switch` paints A/B/X/Y over the
   PSP glyphs as each texture is decoded (no files from the disc needed; also
   works on PC). It measures the game's glyph (disk, ring, fill and symbol

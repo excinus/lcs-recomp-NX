@@ -2,6 +2,7 @@
 #include "lcs_key_bindings.hpp"
 #include "lcs_render_config.hpp"
 #include "lcs_save_picker.hpp"
+#include "lcs_savedata_crypto.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -329,6 +330,22 @@ int triggers() {
     return 0;
 }
 
+// SAVEDATA_PARAMS[0] = 0x21, as a PSP writes it for a keyed save.
+std::vector<std::uint8_t> mark_sfo_encrypted(std::vector<std::uint8_t> bytes) {
+    const std::string key = "SAVEDATA_PARAMS";
+    const std::uint32_t key_start = bytes[8] | (bytes[9] << 8) | (bytes[10] << 16) | (bytes[11] << 24);
+    const std::uint32_t data_start = bytes[12] | (bytes[13] << 8) | (bytes[14] << 16) | (bytes[15] << 24);
+    const std::uint32_t count = bytes[16];
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const std::size_t at = 20u + index * 16u;
+        const std::size_t name = key_start + (bytes[at] | (bytes[at + 1] << 8));
+        if (std::string(reinterpret_cast<const char *>(&bytes[name])) != key) continue;
+        const std::size_t data = data_start + (bytes[at + 12] | (bytes[at + 13] << 8));
+        bytes[data] = 0x21u;
+    }
+    return bytes;
+}
+
 void write_bytes(const std::filesystem::path &path, const std::vector<std::uint8_t> &bytes) {
     std::filesystem::create_directories(path.parent_path());
     std::ofstream out(path, std::ios::binary);
@@ -356,6 +373,8 @@ int saves() {
     write_bytes(root / "ULUS10041S0" / "DATA.BIN", plain);
     write_bytes(root / "ULUS10041S0" / "PARAM.SFO", sfo_bytes);
     write_bytes(root / "ULUS10041S2" / "DATA.BIN", plain);
+    // A save decrypted on a PC keeps the PSP's PARAM.SFO, which says encrypted.
+    write_bytes(root / "ULUS10041S2" / "PARAM.SFO", mark_sfo_encrypted(sfo_bytes));
     write_bytes(root / "ULES00151S1" / "DATA.BIN", plain);
     write_bytes(root / "ULES00151S3" / "DATA.BIN", noise);
     write_bytes(root / "ULUS10160S0" / "DATA.BIN", plain);  // another game: left out
@@ -367,6 +386,10 @@ int saves() {
         load[2].game_id != "ULES00151" || !load[3].encrypted || load[2].encrypted)
         return fail("load list order");
     if (load[0].detail != "The Sicilian Gambit") return fail("detail line");
+    if (load[1].encrypted) return fail("plain data under an encrypted PARAM.SFO");
+    if (const auto marked = parse_save_sfo(mark_sfo_encrypted(sfo_bytes));
+        !marked || !marked->crypt_mode || *marked->crypt_mode != 0x21u)
+        return fail("test SFO not marked");
 
     save_picker_begin(SavePickerMode::Load, load, 0);
     if (!save_picker_active() || !host_settings_open()) return fail("list not up");
@@ -388,8 +411,8 @@ int saves() {
         return fail("foreign pick");
 
     save_picker_begin(SavePickerMode::Load, load, 3);
-    host_settings_handle(HostSettingsKey::Confirm);  // encrypted: a message
-    host_settings_handle(HostSettingsKey::Confirm);  // back to the list
+    host_settings_handle(HostSettingsKey::Confirm);  // another release, encrypted: asks
+    host_settings_handle(HostSettingsKey::Close);    // no: back to the list
     host_settings_handle(HostSettingsKey::Close);
     if (save_picker_take(chosen) != SavePickerOutcome::Cancelled) return fail("cancel");
 
@@ -412,6 +435,47 @@ int saves() {
     return 0;
 }
 
+// PSP savedata decryption: known answers (4116-byte input, bytes (i*7+3)&255,
+// key 00..0F), cross-checked against an independent transcription of the PSP
+// scheme; 4100 bytes span three 2048-byte chunks of the keystream.
+int crypto() {
+    using namespace lcs;
+    std::vector<std::uint8_t> file(16u + 4100u);
+    for (std::size_t index = 0; index < file.size(); ++index) file[index] = static_cast<std::uint8_t>((index * 7u + 3u) & 255u);
+    std::array<std::uint8_t, 16> key{};
+    for (std::size_t index = 0; index < 16u; ++index) key[index] = static_cast<std::uint8_t>(index);
+    const auto hex = [](const std::vector<std::uint8_t> &data, std::size_t at, std::size_t count) {
+        std::string text;
+        char part[3];
+        for (std::size_t index = at; index < at + count; ++index) {
+            std::snprintf(part, sizeof(part), "%02x", data[index]);
+            text += part;
+        }
+        return text;
+    };
+    const struct { int mode; const char *head; const char *tail; } cases[] = {
+        {1, "14180f6f1ce4d63b", "776607d6828e921cb1e8"},
+        {3, "435aaaac52b31f99", "06aa908010cc4a52c5e0"},
+        {5, "8755a63ed76d2132", "2c830f1187c29cabfd0d"},
+    };
+    for (const auto &item : cases) {
+        const auto out = decrypt_psp_savedata(file, item.mode, key);
+        if (!out || out->size() != 4100u) return fail("decrypt size");
+        if (hex(*out, 0, 8) != item.head || hex(*out, 4090, 10) != item.tail) {
+            std::cerr << "mode " << item.mode << ": " << hex(*out, 0, 8) << " .. " << hex(*out, 4090, 10) << "\n";
+            return fail("decrypt known answer");
+        }
+    }
+    if (savedata_crypt_mode(0x21u) != 3 || savedata_crypt_mode(0x41u) != 5 || savedata_crypt_mode(0u) != 0)
+        return fail("crypt mode flags");
+    std::vector<std::uint8_t> zeros(8192u, 0u);
+    if (savedata_looks_encrypted(zeros)) return fail("zeros look encrypted");
+    if (!savedata_looks_encrypted(*decrypt_psp_savedata(std::vector<std::uint8_t>(16u + 8192u, 0u), 3, key)))
+        return fail("keystream does not look encrypted");
+    std::cout << "modes=1,3,5 known_answers=ok\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -425,5 +489,6 @@ int main(int argc, char **argv) {
     if (mode == "persist") return persist();
     if (mode == "triggers") return triggers();
     if (mode == "saves") return saves();
+    if (mode == "crypto") return crypto();
     return 2;
 }

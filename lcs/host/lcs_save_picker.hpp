@@ -26,7 +26,7 @@ struct SaveSlot {
     std::filesystem::path directory;
     bool exists{false};
     bool foreign{false};    // another release's save
-    bool encrypted{false};  // made by a PSP: DATA.BIN is encrypted and cannot be read here
+    bool encrypted{false};  // DATA.BIN as a PSP stores it (decrypted on load with the game's key)
     std::string title;      // PARAM.SFO SAVEDATA_TITLE
     std::string detail;     // PARAM.SFO SAVEDATA_DETAIL
     std::string when;       // "2026-11-04 18:02"
