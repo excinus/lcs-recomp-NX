@@ -83,6 +83,11 @@ GeGpuHardwareTransform hw_identity(bool cull, bool ccw) {
     return t;
 }
 
+constexpr std::uint32_t kGridDraws = 408u;
+std::uint32_t grid_color(std::uint32_t index) {
+    return 0xFF000000u | (200u << 16u) | (((index >> 8u) * 100u + 50u) << 8u) | (index & 0xFFu);
+}
+
 bool run_frame(int frame, const char *out_dir) {
     ge_gpu_backend_set_display_framebuffer(kDisplay, 480u, 272u);
     // 1. Background quad, dark blue, and a red quad in the top-left corner.
@@ -207,6 +212,21 @@ bool run_frame(int frame, const char *out_dir) {
         const std::uint32_t indices[] = {0u, 1u, 2u, 2u, 1u, 3u};
         (void)ge_gpu_backend_accumulate_hardware_packed_0115(d, t, packed, 4u, indices);
     }
+    // 9. 408 small quads, each placed by its own transform (uniforms), in the
+    //    bottom-left corner: more than one batched-uniform range (341 draws).
+    for (std::uint32_t index = 0u; index < kGridDraws; ++index) {
+        GeGpuDrawDescriptor d = base_draw();
+        GeGpuHardwareTransform t = hw_identity(false, false);
+        const std::uint32_t px = (index % 24u) * 4u;
+        const std::uint32_t py = 204u + (index / 24u) * 4u;
+        t.model_to_clip[12] = (static_cast<float>(px) - 240.0f) / 240.0f;
+        t.model_to_clip[13] = (136.0f - static_cast<float>(py)) / 136.0f;
+        const float w = 3.0f / 240.0f, h = 3.0f / 136.0f;
+        const std::uint32_t rgba = grid_color(index);
+        std::vector<GeGpuVertex> vs = {v(0, 0, 0, rgba), v(w, 0, 0, rgba), v(0, -h, 0, rgba),
+                                       v(w, 0, 0, rgba), v(w, -h, 0, rgba), v(0, -h, 0, rgba)};
+        ge_gpu_backend_accumulate_hardware_triangles(d, t, vs, {});
+    }
     const bool shown = ge_gpu_backend_finish_color_frame(static_cast<std::uint64_t>(frame));
     // The Vulkan readback lands at the next finish.
     (void)ge_gpu_backend_finish_color_frame(static_cast<std::uint64_t>(frame) + 1u);
@@ -299,6 +319,19 @@ int main(int argc, char **argv) {
         {"packed 0115 quad", 432, 34, 0, 255, 0},
     };
     int failures = 0;
+    for (const std::uint32_t index : {0u, 5u, 340u, 341u, 342u, 407u}) {
+        if (!ok) break;
+        const std::uint32_t x = (index % 24u) * 4u + 1u, y = 204u + (index / 24u) * 4u + 1u;
+        const std::size_t at = (static_cast<std::size_t>(y) * 480u + x) * 4u;
+        const std::uint32_t want = grid_color(index);
+        const int r = static_cast<int>(rgba[at]), g = static_cast<int>(rgba[at + 1u]), b = static_cast<int>(rgba[at + 2u]);
+        const bool match = std::abs(r - static_cast<int>(want & 0xFFu)) <= 2 &&
+                           std::abs(g - static_cast<int>((want >> 8u) & 0xFFu)) <= 2 &&
+                           std::abs(b - static_cast<int>((want >> 16u) & 0xFFu)) <= 2;
+        if (!match) ++failures;
+        std::printf("%s grid draw %-18u (%d,%d,%d) expected (%u,%u,%u)\n", match ? "ok  " : "FAIL", index, r, g, b,
+                    want & 0xFFu, (want >> 8u) & 0xFFu, (want >> 16u) & 0xFFu);
+    }
     for (const Expect &e : expects) {
         if (!ok) break;
         const std::size_t at = (static_cast<std::size_t>(e.y) * 480u + static_cast<std::size_t>(e.x)) * 4u;

@@ -106,8 +106,8 @@ jobs:
       - name: Build
         run: |
           cmake -S . -B out/gl -G Ninja -DCMAKE_BUILD_TYPE=Release -DLCS_GE_OPENGL=ON
-          ninja -C out/gl lcs_ge_gl_backend_test lcs_host_menu_test lcs_switch_malloc_test
+          ninja -C out/gl lcs_ge_gl_backend_test lcs_host_menu_test lcs_switch_malloc_test lcs_ge_transfer_test
       - name: Test
         run: >
           xvfb-run -a ctest --test-dir out/gl --output-on-failure
-          -R "lcs_ge_gl_backend_test|lcs_host_menu_|lcs_switch_malloc_test"
+          -R "lcs_ge_gl_backend_test|lcs_host_menu_|lcs_switch_malloc_test|lcs_ge_transfer_test"

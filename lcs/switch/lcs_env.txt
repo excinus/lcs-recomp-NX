@@ -25,6 +25,14 @@
 # Run the GE on the game thread instead of its own thread.
 #LCS_GE_ASYNC=0
 
+# The game goes on while the GE thread draws its previous lists (as on a PSP,
+# where the GE runs beside the CPU). 0 waits for the GE at every list.
+#LCS_GE_OVERLAP=0
+
+# OpenGL: per-draw values for up to 341 draws in one uniform range (GL 4.2
+# base instance). 0 binds a range per draw.
+#LCS_GL_BATCHED_UNIFORMS=0
+
 # OpenGL: wait for the display on each frame; flip culling if faces vanish.
 #LCS_GL_VSYNC=1
 #LCS_GL_INVERT_WINDING=1

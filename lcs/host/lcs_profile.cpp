@@ -1868,6 +1868,43 @@ void ge_worker_wait_idle() {
     ge_worker.cv.wait(lock, [] { return ge_worker.tasks.empty() && !ge_worker.busy; });
 }
 
+// Time the game thread spent waiting for the GE worker, for the [watch] line.
+std::atomic<std::uint64_t> ge_wait_enqueue_us{0u};
+std::atomic<std::uint64_t> ge_wait_sync_us{0u};
+
+template <class Wait>
+void timed_ge_wait(std::atomic<std::uint64_t> &counter, Wait &&wait) {
+    const auto start = std::chrono::steady_clock::now();
+    wait();
+    counter.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - start).count()),
+                      std::memory_order_relaxed);
+}
+
+// Lists queued but not yet run, at most `limit`.
+void ge_worker_wait_queue_below(std::size_t limit) {
+    std::unique_lock lock(ge_worker.mutex);
+    if (!ge_worker.started) return;
+    ge_worker.cv.wait(lock, [limit] { return ge_worker.tasks.size() < limit; });
+}
+
+// The GE runs beside the CPU on a PSP: sceGeListEnQueue returns at once and
+// the game waits in sceGeDrawSync. Waiting for the worker at every enqueue
+// (the PC default) runs the game and the GE in turn. On the Switch the game
+// goes on while the worker draws; LCS_GE_OVERLAP=0 turns it off.
+bool ge_overlap_enabled() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("LCS_GE_OVERLAP");
+        if (text != nullptr && *text != '\0') return std::strcmp(text, "0") != 0;
+#if defined(__SWITCH__)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return enabled;
+}
+
 void ge_worker_stop() {
     std::thread worker;
     {
@@ -1941,6 +1978,44 @@ void execute_ge_list_frame(psprecomp::Runtime &rt, std::uint32_t list_address, s
     g_ge_last_list_address = list_address;
 }
 
+// A guest framebuffer as a 24-bit BMP, for the stalled-frame report.
+void dump_guest_framebuffer(psprecomp::Runtime &rt, std::uint32_t address, std::uint32_t stride,
+                            std::uint32_t format, const std::string &name) {
+    constexpr std::uint32_t kWidth = 480u, kHeight = 272u;
+    const std::uint32_t bytes_per_pixel = format == 3u ? 4u : 2u;
+    if (address == 0u || stride < kWidth) return;
+    const std::uint8_t *source = rt.memory().raw_pointer(address, static_cast<std::size_t>(stride) * kHeight * bytes_per_pixel);
+    if (source == nullptr) return;
+    const std::uint32_t row_bytes = kWidth * 3u;
+    const std::uint32_t image_bytes = row_bytes * kHeight;
+    std::vector<std::uint8_t> file(54u + image_bytes, 0u);
+    const auto put32 = [&](std::size_t at, std::uint32_t value) {
+        for (int index = 0; index < 4; ++index) file[at + index] = static_cast<std::uint8_t>(value >> (8 * index));
+    };
+    file[0] = 'B'; file[1] = 'M';
+    put32(2, static_cast<std::uint32_t>(file.size())); put32(10, 54u); put32(14, 40u);
+    put32(18, kWidth); put32(22, kHeight); file[26] = 1; file[28] = 24; put32(34, image_bytes);
+    for (std::uint32_t y = 0; y < kHeight; ++y) {
+        std::uint8_t *out = file.data() + 54u + static_cast<std::size_t>(kHeight - 1u - y) * row_bytes;
+        for (std::uint32_t x = 0; x < kWidth; ++x) {
+            const std::uint8_t *p = source + (static_cast<std::size_t>(y) * stride + x) * bytes_per_pixel;
+            std::uint32_t r = 0, g = 0, b = 0;
+            if (format == 3u) { r = p[0]; g = p[1]; b = p[2]; }
+            else {
+                const std::uint32_t v = p[0] | (p[1] << 8u);
+                if (format == 0u) { r = (v & 31u) << 3u; g = ((v >> 5u) & 63u) << 2u; b = ((v >> 11u) & 31u) << 3u; }
+                else if (format == 1u) { r = (v & 31u) << 3u; g = ((v >> 5u) & 31u) << 3u; b = ((v >> 10u) & 31u) << 3u; }
+                else { r = (v & 15u) << 4u; g = ((v >> 4u) & 15u) << 4u; b = ((v >> 8u) & 15u) << 4u; }
+            }
+            out[x * 3u + 0u] = static_cast<std::uint8_t>(b);
+            out[x * 3u + 1u] = static_cast<std::uint8_t>(g);
+            out[x * 3u + 2u] = static_cast<std::uint8_t>(r);
+        }
+    }
+    std::ofstream output(name, std::ios::binary | std::ios::trunc);
+    if (output) output.write(reinterpret_cast<const char *>(file.data()), static_cast<std::streamsize>(file.size()));
+}
+
 void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
     std::uint32_t present_buffer = request.display_buffer;
     std::uint32_t present_stride = request.display_stride;
@@ -1981,7 +2056,29 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
     const bool transfer_to_display = transfers.count != 0u && request.display_buffer != 0u &&
         (transfers.last_destination & 0x0FFFFFFFu) >= (request.display_buffer & 0x0FFFFFFFu) &&
         (transfers.last_destination & 0x0FFFFFFFu) < (request.display_buffer & 0x0FFFFFFFu) + display_bytes;
+    const GeListDigest digest = ge_list_digest_take();
     if (request.stalled) {
+        std::cout << "[present] stalled lists: " << digest.primitives << " primitives (by type";
+        for (std::uint32_t count : digest.by_type) std::cout << " " << count;
+        std::cout << "), render target 0x" << std::hex << render_target << std::dec << " stride " << render_stride << "\n";
+        for (std::size_t index = 0; index < digest.recorded; ++index) {
+            const GeListDigest::Primitive &p = digest.first[index];
+            std::cout << "[present]   prim " << p.type << " n=" << p.count << " vtype=0x" << std::hex << p.vertex_type
+                      << " fb=0x" << p.framebuffer << " tex=" << (p.textured ? "on" : "off") << " fmt=" << std::dec
+                      << p.texture_format << " 0x" << std::hex << p.texture << std::dec
+                      << (p.clear ? " clear" : "") << "\n";
+        }
+        static int dumps = 0;
+        if (dumps < 6) {
+            ++dumps;
+            const std::string stem = "stall" + std::to_string(dumps);
+            dump_guest_framebuffer(rt, request.display_buffer, request.display_stride, request.pixel_format,
+                                   stem + "_display.bmp");
+            if (render_target != 0u && render_target != request.display_buffer)
+                dump_guest_framebuffer(rt, render_target, render_stride, request.pixel_format, stem + "_target.bmp");
+            std::cout << "[present]   saved " << stem << "_display.bmp / _target.bmp (format "
+                      << request.pixel_format << ")\n";
+        }
         std::cout << "[present] stalled frame: gpu_frame=" << gpu_frame_ready << " transfers=" << transfers.count
                   << " last_to=0x" << std::hex << transfers.last_destination << std::dec << " "
                   << transfers.last_width << "x" << transfers.last_height
@@ -2133,6 +2230,11 @@ void lcs_starvation_tick(psprecomp::Runtime &starvation_runtime, psprecomp::Alle
 void set_wall_clock_limit(double seconds) {
     wall_clock_limit_seconds = seconds;
     wall_clock_start = std::chrono::steady_clock::now();
+}
+
+GeWaitStats ge_wait_stats() noexcept {
+    return GeWaitStats{ge_wait_enqueue_us.load(std::memory_order_relaxed),
+                       ge_wait_sync_us.load(std::memory_order_relaxed)};
 }
 
 void ge_worker_shutdown() {
@@ -3554,7 +3656,18 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 const GeListPrescan scan = prescan_ge_list(rt.memory(), list_address);
                 list_finished = scan.finished;
                 finish_argument = scan.finish_argument;
-            } else if (ge_worker_wait_idle(); ge_async_enabled()) {
+            } else if (ge_async_enabled() && ge_overlap_enabled()) {
+                // At most a few lists ahead of the worker.
+                timed_ge_wait(ge_wait_enqueue_us, [] { ge_worker_wait_queue_below(4u); });
+                lcs_menu_enqueue();
+                const GeListPrescan scan = prescan_ge_list(rt.memory(), list_address);
+                list_finished = scan.finished;
+                finish_argument = scan.finish_argument;
+                const std::uint64_t vblank = display_vblank_index;
+                ge_worker_submit([&rt, list_address, vblank] {
+                    execute_ge_list_frame(rt, list_address, vblank);
+                });
+            } else if (timed_ge_wait(ge_wait_enqueue_us, [] { ge_worker_wait_idle(); }); ge_async_enabled()) {
                 lcs_menu_enqueue();
                 const GeListPrescan scan = prescan_ge_list(rt.memory(), list_address);
                 list_finished = scan.finished;
@@ -3582,7 +3695,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         });
     runtime.register_hle("sceGe_user", 0xB287BD61u,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
-            ge_worker_wait_idle();
+            timed_ge_wait(ge_wait_sync_us, [] { ge_worker_wait_idle(); });
             ctx.set_gpr(2, 0u);
         });
     runtime.register_hle("sceGe_user", 0xA4FC06A4u,

@@ -90,6 +90,17 @@ Small `__SWITCH__` changes in shared code:
   in guest memory. When the game loads without vblank (`present_if_stalled`)
   and a transfer wrote into the displayed buffer, that buffer is shown; the
   log also lists every draw of that frame (`[gl]` lines) and the transfers.
+- `lcs_profile.cpp`: `sceGeListEnQueue` no longer waits for the GE worker to
+  go idle (at most four lists queued); the game waits in `sceGeDrawSync`, as
+  on a PSP. The prescan keeps its own BASE/OFFSET registers. `[watch]` shows
+  how long the game waits at each. `LCS_GE_OVERLAP=0` restores the old way.
+- `ge_gpu_backend_gl.cpp`: per-draw uniforms go in arrays of 341 blocks per
+  64 KiB range; each draw finds its block through an instanced attribute and
+  its base instance (GL 4.2), so the range is bound once per 341 draws, not
+  per draw (each bind made nouveau re-emit the constant buffer).
+  `LCS_GL_BATCHED_UNIFORMS=0` goes back to a range per draw.
+- Stalled presents also log the lists' primitives and save the displayed and
+  render-target buffers as `stallN_display.bmp` / `stallN_target.bmp`.
 - `[watch]` lines count audio gaps (queue ran dry) and skips (blocks dropped
   over the latency limit).
 - `lcs_savedata_crypto.cpp`: reads saves a PSP or PPSSPP encrypted

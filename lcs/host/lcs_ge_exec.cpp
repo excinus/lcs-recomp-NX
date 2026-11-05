@@ -22,6 +22,25 @@ std::uint32_t ge_finish_arg = 0u;
 constexpr std::uint32_t kMaxCommands = 2'000'000u;
 
 GeBlockTransfers block_transfers{};
+GeListDigest list_digest{};
+
+void note_primitive(std::uint32_t data) {
+    GeListDigest &digest = list_digest;
+    const std::uint32_t primitive = (data >> 16u) & 7u;
+    ++digest.primitives;
+    ++digest.by_type[primitive];
+    if (digest.recorded < digest.first.size()) {
+        GeListDigest::Primitive &record = digest.first[digest.recorded++];
+        record.type = primitive;
+        record.count = data & 0xFFFFu;
+        record.vertex_type = ge_commands[0x12u] & 0x00FFFFFFu;
+        record.framebuffer = ((ge_commands[0x9Cu] & 0x00FFFFF0u) | ((ge_commands[0x9Du] & 0x00FF0000u) << 8u));
+        record.textured = (ge_commands[0x1Eu] & 1u) != 0u;
+        record.texture_format = ge_commands[0xC3u] & 0xFu;
+        record.texture = (ge_commands[0xA0u] & 0x00FFFFF0u) | ((ge_commands[0xA8u] & 0x000F0000u) << 8u);
+        record.clear = (ge_commands[0xD3u] & 1u) != 0u;
+    }
+}
 
 // TRXKICK (0xEA): the GE's rectangle copy between two buffers in guest
 // memory, as the game uses it to put a whole picture (a loading card) into a
@@ -128,6 +147,7 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
             GeRenderStats stats{};
             std::string error;
             lcs_set_ge_command(op_pc);
+            note_primitive(data);
             if (!render_ge_primitive(memory, ge_commands, ge_transform, ge_vertex_address,
                                      ge_index_address, data, stats, error)) {
                 flush_ge_deferred_rasterization(memory);
@@ -144,6 +164,12 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
     flush_ge_deferred_rasterization(memory);
 }
 
+GeListDigest ge_list_digest_take() {
+    const GeListDigest taken = list_digest;
+    list_digest = GeListDigest{};
+    return taken;
+}
+
 GeBlockTransfers ge_block_transfers_take() {
     const GeBlockTransfers taken = block_transfers;
     block_transfers = GeBlockTransfers{};
@@ -153,8 +179,13 @@ GeBlockTransfers ge_block_transfers_take() {
 GeListPrescan prescan_ge_list(psprecomp::GuestMemory &memory, std::uint32_t list_address) {
     GeListPrescan result{};
     if (list_address == 0u) return result;
-    std::uint32_t base_register = ge_base_register;
-    std::uint32_t offset_address = ge_offset_address;
+    // Its own copy of BASE and OFFSET, carried from list to list as the GE
+    // carries them: the game thread scans a list while the GE worker may still
+    // be executing an earlier one with the real registers.
+    static std::uint32_t shadow_base = 0u;
+    static std::uint32_t shadow_offset = 0u;
+    std::uint32_t &base_register = shadow_base;
+    std::uint32_t &offset_address = shadow_offset;
     const auto relative = [&](std::uint32_t data24) {
         const std::uint32_t extended = ((base_register & 0x000F0000u) << 8u) | (data24 & 0x00FFFFFFu);
         return (offset_address + extended) & 0x0FFFFFFFu;

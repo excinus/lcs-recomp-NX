@@ -204,6 +204,10 @@ if(PSPRECOMP_BUILD_TESTS)
         target_link_libraries(lcs_ge_gl_backend_test PRIVATE PkgConfig::SDL2 Threads::Threads)
         add_test(NAME lcs_ge_gl_backend_test COMMAND lcs_ge_gl_backend_test)
         set_tests_properties(lcs_ge_gl_backend_test PROPERTIES SKIP_RETURN_CODE 77)
+        # The same with one uniform range per draw (the path without GL 4.2).
+        add_test(NAME lcs_ge_gl_backend_test_per_draw COMMAND lcs_ge_gl_backend_test)
+        set_tests_properties(lcs_ge_gl_backend_test_per_draw PROPERTIES SKIP_RETURN_CODE 77
+                             ENVIRONMENT "LCS_GL_BATCHED_UNIFORMS=0")
     endif()
     if(NOT WIN32)
         # The Switch build's allocator (lcs/switch/switch_malloc.cpp) over a fake heap.

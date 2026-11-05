@@ -40,6 +40,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <type_traits>
 #include <vector>
 
 #ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
@@ -143,6 +144,29 @@ struct GlApi {
 };
 
 GlApi gl;
+
+// GL 4.2 entry points for the batched uniforms (see GlState::batched); the
+// backend works without them.
+struct GlBatchApi {
+    void(APIENTRY *DrawElementsInstancedBaseVertexBaseInstance)(GLenum, GLsizei, GLenum, const void *, GLsizei,
+                                                                GLint, GLuint) = nullptr;
+    void(APIENTRY *DrawArraysInstancedBaseInstance)(GLenum, GLint, GLsizei, GLsizei, GLuint) = nullptr;
+    void(APIENTRY *VertexAttribIPointer)(GLuint, GLint, GLenum, GLsizei, const void *) = nullptr;
+    void(APIENTRY *VertexAttribDivisor)(GLuint, GLuint) = nullptr;
+};
+GlBatchApi gl_batch;
+
+bool load_gl_batch() {
+    const auto load = [](auto &slot, const char *name) {
+        slot = reinterpret_cast<std::remove_reference_t<decltype(slot)>>(SDL_GL_GetProcAddress(name));
+        return slot != nullptr;
+    };
+    bool ok = load(gl_batch.DrawElementsInstancedBaseVertexBaseInstance, "glDrawElementsInstancedBaseVertexBaseInstance");
+    ok = load(gl_batch.DrawArraysInstancedBaseInstance, "glDrawArraysInstancedBaseInstance") && ok;
+    ok = load(gl_batch.VertexAttribIPointer, "glVertexAttribIPointer") && ok;
+    ok = load(gl_batch.VertexAttribDivisor, "glVertexAttribDivisor") && ok;
+    return ok;
+}
 
 bool load_gl(std::string &error) {
     bool ok = true;
@@ -303,6 +327,11 @@ struct GlState {
     std::uint32_t guest_height{};
     std::vector<std::uint8_t> overlay_pixels;
     std::uint32_t uniform_align{256u};
+    // Batched uniforms (kBatchedUniformBlock): draw_chunk blocks per range.
+    bool batched{false};
+    std::uint32_t draw_chunk{0u};
+    std::size_t chunk_stride{0u};
+    GLuint draw_id_buffer{};
     float max_lod_bias{2.0f};
     float max_anisotropy{1.0f};
     bool anisotropy{};
@@ -386,6 +415,30 @@ layout(std140) uniform DrawUniforms {
     uvec4 pixel0;
     uvec4 pixel1;
 } u;
+)";
+
+// Batched form: up to DRAW_CHUNK draws' blocks in one uniform buffer range,
+// each draw finding its own by an instanced attribute (its base instance), so
+// the range is rebound once per chunk instead of once per draw.
+constexpr const char *kBatchedUniformBlock = R"(
+struct DrawData {
+    vec4 row0;
+    vec4 row1;
+    vec4 row2;
+    vec4 row3;
+    vec4 viewZ;
+    vec4 uvScaleOffset;
+    vec4 fogParameters;
+    uvec4 control;
+    vec4 colorMul;
+    vec4 colorAdd;
+    uvec4 pixel0;
+    uvec4 pixel1;
+};
+layout(std140) uniform DrawUniforms {
+    DrawData draws[DRAW_CHUNK];
+};
+#define u draws[DRAW_ID]
 )";
 
 constexpr const char *kVertexShader = R"(
@@ -605,6 +658,7 @@ GLuint link_program(const std::string &vertex_source, const std::string &fragmen
         gl.BindAttribLocation(program, 2u, "inUv");
         gl.BindAttribLocation(program, 3u, "inQ");
         gl.BindAttribLocation(program, 4u, "inFog");
+        gl.BindAttribLocation(program, 5u, "inDrawId");
         gl.BindFragDataLocation(program, 0u, "outColor");
     } else {
         gl.BindFragDataLocation(program, 0u, "color");
@@ -1336,7 +1390,7 @@ void destroy_backend(GlState &s) noexcept {
         const GLuint samplers[]{s.white_sampler, s.present_linear, s.present_nearest};
         for (GLuint sampler : samplers)
             if (sampler != 0u) gl.DeleteSamplers(1, &sampler);
-        const GLuint buffers[]{s.vertex_buffer, s.index_buffer, s.uniform_buffer};
+        const GLuint buffers[]{s.vertex_buffer, s.index_buffer, s.uniform_buffer, s.draw_id_buffer};
         for (GLuint buffer : buffers)
             if (buffer != 0u) gl.DeleteBuffers(1, &buffer);
         if (s.vao != 0u) gl.DeleteVertexArrays(1, &s.vao);
@@ -1353,7 +1407,8 @@ void destroy_backend(GlState &s) noexcept {
     s.white = s.fps_overlay = s.settings_overlay = s.guest_image = s.save_list = 0u;
     s.save_list_version = 0u;
     s.white_sampler = s.present_linear = s.present_nearest = 0u;
-    s.vertex_buffer = s.index_buffer = s.uniform_buffer = 0u;
+    s.vertex_buffer = s.index_buffer = s.uniform_buffer = s.draw_id_buffer = 0u;
+    s.batched = false;
     s.vao = s.present_vao = 0u;
     s.program = s.present_program = 0u;
     s.enabled = false;
@@ -1424,8 +1479,37 @@ bool create_backend(GlState &s, std::string &error) {
     while (s.uniform_align < sizeof(DrawUniforms)) s.uniform_align *= 2u;
 
     const std::string header = "#version 330 core\n";
-    s.program = link_program(header + kUniformBlock + kVertexShader, header + kUniformBlock + kFragmentShader,
-                             true, error);
+    {
+        const char *setting = std::getenv("LCS_GL_BATCHED_UNIFORMS");
+        const bool wanted = setting == nullptr || std::strcmp(setting, "0") != 0;
+        GLint max_block = 16384;
+        gl.GetIntegerv(0x8A30 /* GL_MAX_UNIFORM_BLOCK_SIZE */, &max_block);
+        s.draw_chunk = std::min<std::uint32_t>(341u, static_cast<std::uint32_t>(std::max<GLint>(max_block, 0)) /
+                                                         static_cast<std::uint32_t>(sizeof(DrawUniforms)));
+        const std::size_t range = static_cast<std::size_t>(s.draw_chunk) * sizeof(DrawUniforms);
+        const std::size_t alignment = static_cast<std::size_t>(std::max<GLint>(align, 16));
+        s.chunk_stride = (range + alignment - 1u) / alignment * alignment;
+        if (wanted && s.draw_chunk >= 16u && load_gl_batch()) {
+            const std::string defines = header + "#define DRAW_CHUNK " + std::to_string(s.draw_chunk) + "\n";
+            std::string vertex = kVertexShader;
+            const std::string tail = "    vFog = fog;\n}";
+            vertex.replace(vertex.rfind(tail), tail.size(), "    vFog = fog;\n    vDrawId = inDrawId;\n}");
+            std::string batch_error;
+            s.program = link_program(
+                defines + "#define DRAW_ID inDrawId\nlayout(location = 5) in uint inDrawId;\nflat out uint vDrawId;\n" +
+                    kBatchedUniformBlock + vertex,
+                defines + "#define DRAW_ID vDrawId\nflat in uint vDrawId;\n" + kBatchedUniformBlock + kFragmentShader,
+                true, batch_error);
+            s.batched = s.program != 0u;
+            if (!s.batched) std::cerr << "[gl] batched uniforms off: " << batch_error << "\n";
+        }
+        std::cerr << "[gl] uniforms " << (s.batched ? "batched, " + std::to_string(s.draw_chunk) + " draws per range"
+                                                     : std::string("per draw")) << "\n";
+    }
+    if (!s.batched) {
+        s.program = link_program(header + kUniformBlock + kVertexShader, header + kUniformBlock + kFragmentShader,
+                                 true, error);
+    }
     if (s.program == 0u) return false;
     const GLuint block = gl.GetUniformBlockIndex(s.program, "DrawUniforms");
     if (block == GL_INVALID_INDEX) {
@@ -1466,6 +1550,20 @@ bool create_backend(GlState &s, std::string &error) {
     gl.VertexAttribPointer(3u, 1, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, q)));
     gl.EnableVertexAttribArray(4u);
     gl.VertexAttribPointer(4u, 1, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, fog_factor)));
+    if (s.batched) {
+        // Draw ids 0..draw_chunk-1, one per instance; a draw's base instance
+        // picks its slot in the bound range.
+        std::vector<std::uint32_t> ids(s.draw_chunk);
+        for (std::uint32_t index = 0u; index < s.draw_chunk; ++index) ids[index] = index;
+        gl.GenBuffers(1, &s.draw_id_buffer);
+        gl.BindBuffer(GL_ARRAY_BUFFER, s.draw_id_buffer);
+        gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(ids.size() * sizeof(std::uint32_t)), ids.data(),
+                      GL_STATIC_DRAW);
+        gl.EnableVertexAttribArray(5u);
+        gl_batch.VertexAttribIPointer(5u, 1, GL_UNSIGNED_INT, 0, nullptr);
+        gl_batch.VertexAttribDivisor(5u, 1u);
+        gl.BindBuffer(GL_ARRAY_BUFFER, s.vertex_buffer);
+    }
     gl.BindVertexArray(0u);
     gl.GenVertexArrays(1, &s.present_vao);
 
@@ -1955,7 +2053,13 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     std::string error;
     const std::size_t draws = std::min<std::size_t>(s.batches.size(), kMaxDraws);
     s.plan.assign(draws, PlannedDraw{});
-    s.uniform_bytes.assign(draws * s.uniform_align, std::byte{0});
+    const auto uniform_offset = [&](std::size_t index) -> std::size_t {
+        if (!s.batched) return index * s.uniform_align;
+        return (index / s.draw_chunk) * s.chunk_stride + (index % s.draw_chunk) * sizeof(DrawUniforms);
+    };
+    s.uniform_bytes.assign(s.batched ? ((draws + s.draw_chunk - 1u) / s.draw_chunk) * s.chunk_stride
+                                     : draws * s.uniform_align,
+                           std::byte{0});
     for (std::size_t index = 0u; index < draws; ++index) {
         const Batch &batch = s.batches[index];
         PlannedDraw &plan = s.plan[index];
@@ -1989,7 +2093,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         }
         const DrawUniforms uniforms =
             make_uniforms(batch, target->logical_width, target->logical_height, plan.textured);
-        std::memcpy(s.uniform_bytes.data() + index * s.uniform_align, &uniforms, sizeof(uniforms));
+        std::memcpy(s.uniform_bytes.data() + uniform_offset(index), &uniforms, sizeof(uniforms));
     }
     if (publish && ge_gpu_describe_next_frame().exchange(false)) describe_frame(s, draws);
     gl.BindBuffer(GL_UNIFORM_BUFFER, s.uniform_buffer);
@@ -2003,6 +2107,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     s.cache = CachedState{};
     s.bound_target = nullptr;
     bool touched_display = false;
+    std::size_t bound_chunk = static_cast<std::size_t>(-1);
     for (std::size_t index = 0u; index < draws; ++index) {
         const Batch &batch = s.batches[index];
         const PlannedDraw &plan = s.plan[index];
@@ -2065,16 +2170,35 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             gl.BindSampler(0u, sampler);
             s.cache.sampler = sampler;
         }
-        gl.BindBufferRange(GL_UNIFORM_BUFFER, 0u, s.uniform_buffer,
-                           static_cast<GLintptr>(index * s.uniform_align), sizeof(DrawUniforms));
         const GLenum mode = strip ? GL_TRIANGLE_STRIP : GL_TRIANGLES;
-        if (batch.indexed)
-            gl.DrawElementsBaseVertex(mode, static_cast<GLsizei>(batch.index_count), GL_UNSIGNED_INT,
-                                      reinterpret_cast<const void *>(
-                                          static_cast<std::size_t>(batch.first_index) * sizeof(std::uint32_t)),
-                                      static_cast<GLint>(batch.first_vertex));
-        else
-            gl.DrawArrays(mode, static_cast<GLint>(batch.first_vertex), static_cast<GLsizei>(batch.vertex_count));
+        const void *first_index = reinterpret_cast<const void *>(
+            static_cast<std::size_t>(batch.first_index) * sizeof(std::uint32_t));
+        if (s.batched) {
+            const std::size_t chunk = index / s.draw_chunk;
+            if (chunk != bound_chunk) {
+                gl.BindBufferRange(GL_UNIFORM_BUFFER, 0u, s.uniform_buffer,
+                                   static_cast<GLintptr>(chunk * s.chunk_stride),
+                                   static_cast<GLsizeiptr>(s.draw_chunk * sizeof(DrawUniforms)));
+                bound_chunk = chunk;
+            }
+            const auto slot = static_cast<GLuint>(index % s.draw_chunk);
+            if (batch.indexed)
+                gl_batch.DrawElementsInstancedBaseVertexBaseInstance(
+                    mode, static_cast<GLsizei>(batch.index_count), GL_UNSIGNED_INT, first_index, 1,
+                    static_cast<GLint>(batch.first_vertex), slot);
+            else
+                gl_batch.DrawArraysInstancedBaseInstance(mode, static_cast<GLint>(batch.first_vertex),
+                                                         static_cast<GLsizei>(batch.vertex_count), 1, slot);
+        } else {
+            gl.BindBufferRange(GL_UNIFORM_BUFFER, 0u, s.uniform_buffer,
+                               static_cast<GLintptr>(index * s.uniform_align), sizeof(DrawUniforms));
+            if (batch.indexed)
+                gl.DrawElementsBaseVertex(mode, static_cast<GLsizei>(batch.index_count), GL_UNSIGNED_INT,
+                                          first_index, static_cast<GLint>(batch.first_vertex));
+            else
+                gl.DrawArrays(mode, static_cast<GLint>(batch.first_vertex),
+                              static_cast<GLsizei>(batch.vertex_count));
+        }
         count_draw(s, batch, plan.textured);
     }
     gl.BindSampler(0u, 0u);

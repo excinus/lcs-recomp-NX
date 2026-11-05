@@ -22,6 +22,7 @@
 
 #include "ge_gpu_backend.hpp"
 #include "lcs_audio_output.hpp"
+#include "lcs_profile.hpp"
 #include "lcs_display_menu.hpp"
 #include "lcs_switch_hooks.hpp"
 
@@ -403,6 +404,7 @@ void watch_main() {
     u64 last_report = start;
     GeGpuBackendReport last_report_gpu{};
     lcs::AudioOutputStats last_audio{};
+    lcs::GeWaitStats last_waits{};
     while (!g_watch_stop.load()) {
         svcSleepThread(10'000'000ll);
         const std::size_t count = g_tracked_count.load();
@@ -470,6 +472,12 @@ void watch_main() {
                       static_cast<unsigned long long>(audio.dropped_blocks - last_audio.dropped_blocks));
         line += tail;
         last_audio = audio;
+        const lcs::GeWaitStats waits = lcs::ge_wait_stats();
+        std::snprintf(tail, sizeof(tail), " | game waits GE: enqueue %.0f%% sync %.0f%%",
+                      double(waits.enqueue_us - last_waits.enqueue_us) / 1e4 / seconds,
+                      double(waits.sync_us - last_waits.sync_us) / 1e4 / seconds);
+        line += tail;
+        last_waits = waits;
         std::printf("%s\n", line.c_str());
 
         if (sampling) {
