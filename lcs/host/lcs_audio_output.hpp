@@ -14,6 +14,13 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
 
 void audio_output_advance(std::uint64_t guest_time_us);
 
+// Gaps (queue ran dry) and skips (blocks dropped over the latency limit).
+struct AudioOutputStats {
+    std::uint64_t underruns{};
+    std::uint64_t dropped_blocks{};
+};
+[[nodiscard]] AudioOutputStats audio_output_stats();
+
 void audio_output_reset_channel(std::uint32_t channel);
 
 void audio_output_shutdown();

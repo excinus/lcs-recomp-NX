@@ -404,15 +404,22 @@ int saves() {
     if (host_settings_open()) return fail("list stayed up");
 
     save_picker_begin(SavePickerMode::Load, load, 2);
-    host_settings_handle(HostSettingsKey::Confirm);  // another release: asks first
-    if (save_picker_take(chosen) != SavePickerOutcome::Pending) return fail("foreign without asking");
-    host_settings_handle(HostSettingsKey::Confirm);
+    host_settings_handle(HostSettingsKey::Confirm);  // another release loads as any other
     if (save_picker_take(chosen) != SavePickerOutcome::Chosen || chosen.game_id != "ULES00151")
         return fail("foreign pick");
 
     save_picker_begin(SavePickerMode::Load, load, 3);
-    host_settings_handle(HostSettingsKey::Confirm);  // another release, encrypted: asks
-    host_settings_handle(HostSettingsKey::Close);    // no: back to the list
+    std::vector<std::uint8_t> picture;
+    std::uint64_t picture_version = 0u;
+    if (!save_picker_image(picture, picture_version) ||
+        picture.size() != kSavePickerImageWidth * kSavePickerImageHeight * 4u)
+        return fail("list picture");
+    const std::uint64_t first_version = picture_version;
+    if (!save_picker_image(picture, picture_version) || picture_version != first_version)
+        return fail("picture redrawn without a change");
+    host_settings_handle(HostSettingsKey::Up);
+    if (!save_picker_image(picture, picture_version) || picture_version == first_version)
+        return fail("picture not redrawn after a move");
     host_settings_handle(HostSettingsKey::Close);
     if (save_picker_take(chosen) != SavePickerOutcome::Cancelled) return fail("cancel");
 

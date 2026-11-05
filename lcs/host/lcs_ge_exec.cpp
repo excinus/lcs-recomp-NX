@@ -4,6 +4,7 @@
 #include "lcs_menu.hpp"
 
 #include <array>
+#include <cstring>
 #include <string>
 
 namespace lcs {
@@ -19,6 +20,44 @@ bool ge_finish_seen = false;
 std::uint32_t ge_finish_arg = 0u;
 
 constexpr std::uint32_t kMaxCommands = 2'000'000u;
+
+GeBlockTransfers block_transfers{};
+
+// TRXKICK (0xEA): the GE's rectangle copy between two buffers in guest
+// memory, as the game uses it to put a whole picture (a loading card) into a
+// framebuffer. Registers: 0xB0/0xB1 source address and stride, 0xB2/0xB3
+// destination, 0xEB/0xEC source and destination x,y, 0xEE size; bit 0 of the
+// kick selects 32-bit pixels.
+void run_block_transfer(psprecomp::GuestMemory &memory, std::uint32_t kick) {
+    const auto address = [](std::uint32_t low, std::uint32_t high) {
+        return ((low & 0x00FFFFF0u) | ((high & 0x00FF0000u) << 8u)) & 0x0FFFFFFFu;
+    };
+    const std::uint32_t source = address(ge_commands[0xB0u], ge_commands[0xB1u]);
+    const std::uint32_t destination = address(ge_commands[0xB2u], ge_commands[0xB3u]);
+    const std::uint32_t source_stride = ge_commands[0xB1u] & 0x7F8u;
+    const std::uint32_t destination_stride = ge_commands[0xB3u] & 0x7F8u;
+    const std::uint32_t source_x = ge_commands[0xEBu] & 0x3FFu;
+    const std::uint32_t source_y = (ge_commands[0xEBu] >> 10u) & 0x3FFu;
+    const std::uint32_t destination_x = ge_commands[0xECu] & 0x3FFu;
+    const std::uint32_t destination_y = (ge_commands[0xECu] >> 10u) & 0x3FFu;
+    const std::uint32_t width = (ge_commands[0xEEu] & 0x3FFu) + 1u;
+    const std::uint32_t height = ((ge_commands[0xEEu] >> 10u) & 0x3FFu) + 1u;
+    const std::uint32_t bytes_per_pixel = (kick & 1u) != 0u ? 4u : 2u;
+    ++block_transfers.count;
+    block_transfers.last_destination = destination;
+    block_transfers.last_width = width;
+    block_transfers.last_height = height;
+    if (source_stride == 0u || destination_stride == 0u) return;
+    const std::size_t row_bytes = static_cast<std::size_t>(width) * bytes_per_pixel;
+    for (std::uint32_t row = 0u; row < height; ++row) {
+        const std::uint32_t from = source + ((source_y + row) * source_stride + source_x) * bytes_per_pixel;
+        const std::uint32_t to = destination + ((destination_y + row) * destination_stride + destination_x) * bytes_per_pixel;
+        const std::uint8_t *in = memory.raw_pointer(from, row_bytes);
+        std::uint8_t *out = memory.raw_pointer(to, row_bytes);
+        if (in == nullptr || out == nullptr) return;
+        std::memmove(out, in, row_bytes);
+    }
+}
 
 std::uint32_t relative_address(std::uint32_t data24) {
     const std::uint32_t extended = ((ge_base_register & 0x000F0000u) << 8u) | (data24 & 0x00FFFFFFu);
@@ -79,6 +118,9 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
             ge_finish_seen = true;
             ge_finish_arg = data;
             break;
+        case 0xEAu:
+            run_block_transfer(memory, data);
+            break;
         case 0x0Cu:
             flush_ge_deferred_rasterization(memory);
             return;
@@ -100,6 +142,12 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
         }
     }
     flush_ge_deferred_rasterization(memory);
+}
+
+GeBlockTransfers ge_block_transfers_take() {
+    const GeBlockTransfers taken = block_transfers;
+    block_transfers = GeBlockTransfers{};
+    return taken;
 }
 
 GeListPrescan prescan_ge_list(psprecomp::GuestMemory &memory, std::uint32_t list_address) {

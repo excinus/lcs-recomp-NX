@@ -15,6 +15,7 @@
 #include "lcs_render_config.hpp"
 #include "lcs_save_picker.hpp"
 #include "lcs_savedata_crypto.hpp"
+#include "lcs_png.hpp"
 #include "lcs_stress_test.hpp"
 #include "lcs_switch_hooks.hpp"
 #include "lcs_world_detail.hpp"
@@ -1082,6 +1083,9 @@ void open_save_picker(psprecomp::Runtime &runtime, std::uint32_t parameter_addre
         if (picker_mode == SavePickerMode::Save && !proposed.empty()) names.push_back(proposed);
     }
     std::vector<SaveSlot> slots = scan_save_slots(savedata_root(runtime), game, names, picker_mode);
+    for (SaveSlot &slot : slots) {
+        if (slot.exists) slot.icon = decode_png_rgba(slot.directory / "ICON0.PNG", slot.icon_width, slot.icon_height);
+    }
     const int focus = save_focus_index(slots, runtime.memory().load32(parameter_address + kSavedataFocusOffset));
     std::cout << "[savedata] " << (picker_mode == SavePickerMode::Load ? "load" : "save") << " list: "
               << slots.size() << " entries for " << game << " (" << names.size() << " slots)\n" << std::flush;
@@ -1970,9 +1974,23 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
 
     bool presented_gpu_frame = false;
     static bool showing_guest_frame = false;
+    // A picture the GE copied into the displayed buffer (TRXKICK) is only in
+    // guest memory: the GPU targets never see it.
+    const GeBlockTransfers transfers = ge_block_transfers_take();
+    const std::uint32_t display_bytes = request.display_stride * 4u * std::max(request.display_height, 272u);
+    const bool transfer_to_display = transfers.count != 0u && request.display_buffer != 0u &&
+        (transfers.last_destination & 0x0FFFFFFFu) >= (request.display_buffer & 0x0FFFFFFFu) &&
+        (transfers.last_destination & 0x0FFFFFFFu) < (request.display_buffer & 0x0FFFFFFFu) + display_bytes;
+    if (request.stalled) {
+        std::cout << "[present] stalled frame: gpu_frame=" << gpu_frame_ready << " transfers=" << transfers.count
+                  << " last_to=0x" << std::hex << transfers.last_destination << std::dec << " "
+                  << transfers.last_width << "x" << transfers.last_height
+                  << " into_display=" << transfer_to_display << "\n" << std::flush;
+    }
     if (ge_gpu_backend_presents_directly()) {
-        const bool show_guest = !gpu_frame_ready && (request.stalled || !holding_gpu_frame) &&
-                                ge_gpu_backend_guest_present_available();
+        const bool show_guest = (request.stalled && transfer_to_display) ||
+                                (!gpu_frame_ready && (request.stalled || !holding_gpu_frame) &&
+                                 ge_gpu_backend_guest_present_available());
         if (!show_guest) {
             ge_gpu_backend_mark_window_presented();
             presented_gpu_frame = true;
@@ -2047,13 +2065,13 @@ std::chrono::steady_clock::time_point last_present_wall{};
 std::uint32_t last_present_framebuffer{};
 std::uint64_t ge_lists_since_present{};
 
-void submit_present(psprecomp::Runtime &rt, const PresentRequest &request) {
+void submit_present(psprecomp::Runtime &rt, const PresentRequest &request, bool always = false) {
     last_present_wall = std::chrono::steady_clock::now();
     last_present_framebuffer = request.display_buffer;
     ge_lists_since_present = 0u;
     if (!ge_async_enabled()) {
         present_frame(rt, request);
-    } else if (ge_worker.pending_presents.load() == 0u) {
+    } else if (always || ge_worker.pending_presents.load() == 0u) {
         ge_worker.pending_presents.fetch_add(1u);
         ge_worker_submit([&rt, request] {
             present_frame(rt, request);
@@ -2079,7 +2097,8 @@ void present_if_stalled(psprecomp::Runtime &rt) {
         std::cout << "[present] loading without vblank: showing frame 0x" << std::hex
                   << display_state.frame_buffer << std::dec << " (" << ge_lists_since_present
                   << " lists)\n" << std::flush;
-    submit_present(rt, make_present_request(rt, true));
+    ge_gpu_describe_next_frame().store(true);
+    submit_present(rt, make_present_request(rt, true), true);
     display_window_pump();
 }
 

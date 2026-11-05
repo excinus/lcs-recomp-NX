@@ -18,4 +18,14 @@ std::uint32_t rendered_finish_argument();
 std::uint32_t rendered_render_target();
 std::uint32_t rendered_render_stride();
 
+// Block transfers (TRXKICK) run since the last call: how many, and where the
+// last one wrote. GE thread only.
+struct GeBlockTransfers {
+    std::uint32_t count{};
+    std::uint32_t last_destination{};
+    std::uint32_t last_width{};
+    std::uint32_t last_height{};
+};
+GeBlockTransfers ge_block_transfers_take();
+
 }

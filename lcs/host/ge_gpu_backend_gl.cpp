@@ -25,6 +25,7 @@
 #include "lcs_prompt_textures.hpp"
 #include "lcs_render_config.hpp"
 #include "lcs_runtime_log.hpp"
+#include "lcs_save_picker.hpp"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -294,6 +295,9 @@ struct GlState {
     GLuint present_nearest{};
     GLuint fps_overlay{};
     GLuint settings_overlay{};
+    GLuint save_list{};                 // the save list's picture (lcs_save_picker)
+    std::vector<std::uint8_t> save_list_pixels;
+    std::uint64_t save_list_version{};
     GLuint guest_image{};
     std::uint32_t guest_width{};
     std::uint32_t guest_height{};
@@ -1246,7 +1250,18 @@ bool present_to_window(GlState &s, GLuint source, std::uint32_t source_width, st
         upload_overlay(s, s.fps_overlay, kFpsOverlayWidth, kFpsOverlayHeight);
         draw_fps = true;
     }
-    if (decision.composite_settings) {
+    // The save list replaces the text panel with its own full picture.
+    const std::uint64_t seen_version = s.save_list_version;
+    const bool draw_save_list = save_picker_image(s.save_list_pixels, s.save_list_version);
+    if (draw_save_list && (s.save_list == 0u || s.save_list_version != seen_version)) {
+        if (s.save_list == 0u) s.save_list = make_texture_2d(kSavePickerImageWidth, kSavePickerImageHeight, nullptr);
+        gl.ActiveTexture(GL_TEXTURE0);
+        gl.BindTexture(GL_TEXTURE_2D, s.save_list);
+        gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(kSavePickerImageWidth),
+                         static_cast<GLsizei>(kSavePickerImageHeight), GL_RGBA, GL_UNSIGNED_BYTE,
+                         s.save_list_pixels.data());
+    }
+    if (decision.composite_settings && !draw_save_list) {
         s.overlay_pixels.assign(static_cast<std::size_t>(kSettingsOverlayWidth) * kSettingsOverlayHeight * 4u, 0u);
         rasterize_settings_overlay(decision.settings, s.overlay_pixels.data(), kSettingsOverlayWidth,
                                    kSettingsOverlayHeight);
@@ -1279,6 +1294,15 @@ bool present_to_window(GlState &s, GLuint source, std::uint32_t source_width, st
         draw_present_layer(s, s.fps_overlay, s.present_linear, 16, 16, panel_w, panel_h, screen_width,
                            screen_height, false);
     }
+    if (draw_save_list) {
+        const float scale = std::min(static_cast<float>(screen_width) / kSavePickerImageWidth,
+                                     static_cast<float>(screen_height) / kSavePickerImageHeight);
+        const auto w = static_cast<std::int32_t>(kSavePickerImageWidth * scale);
+        const auto h = static_cast<std::int32_t>(kSavePickerImageHeight * scale);
+        draw_present_layer(s, s.save_list, s.present_linear, (static_cast<std::int32_t>(screen_width) - w) / 2,
+                           (static_cast<std::int32_t>(screen_height) - h) / 2, w, h, screen_width, screen_height,
+                           true);
+    }
     if (draw_settings) {
         const bool centered = decision.settings.centered;
         const float share = centered ? 0.62f : 0.46f;
@@ -1306,7 +1330,7 @@ void destroy_backend(GlState &s) noexcept {
         for (auto &entry : s.textures)
             if (entry.second.texture != 0u) gl.DeleteTextures(1, &entry.second.texture);
         for (auto &entry : s.samplers) gl.DeleteSamplers(1, &entry.second);
-        const GLuint textures[]{s.white, s.fps_overlay, s.settings_overlay, s.guest_image};
+        const GLuint textures[]{s.white, s.fps_overlay, s.settings_overlay, s.guest_image, s.save_list};
         for (GLuint texture : textures)
             if (texture != 0u) gl.DeleteTextures(1, &texture);
         const GLuint samplers[]{s.white_sampler, s.present_linear, s.present_nearest};
@@ -1326,7 +1350,8 @@ void destroy_backend(GlState &s) noexcept {
     s.targets.clear();
     s.textures.clear();
     s.samplers.clear();
-    s.white = s.fps_overlay = s.settings_overlay = s.guest_image = 0u;
+    s.white = s.fps_overlay = s.settings_overlay = s.guest_image = s.save_list = 0u;
+    s.save_list_version = 0u;
     s.white_sampler = s.present_linear = s.present_nearest = 0u;
     s.vertex_buffer = s.index_buffer = s.uniform_buffer = 0u;
     s.vao = s.present_vao = 0u;
@@ -1700,6 +1725,32 @@ bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte> destination) noe
     return true;
 }
 
+namespace {
+
+// The draws of one frame, for the log (see ge_gpu_describe_next_frame).
+void describe_frame(const GlState &s, std::size_t draws) {
+    std::printf("[gl] frame of %zu draws, display 0x%x\n", draws, s.display_framebuffer);
+    std::size_t shown = 0u;
+    for (std::size_t index = 0u; index < draws && shown < 40u; ++index, ++shown) {
+        const Batch &batch = s.batches[index];
+        const PlannedDraw &plan = s.plan[index];
+        const GeGpuDrawDescriptor &d = batch.draw;
+        const UploadVertex &first = s.vertices[std::min<std::size_t>(batch.first_vertex, s.vertices.empty() ? 0u : s.vertices.size() - 1u)];
+        std::printf("[gl]  #%zu fb=0x%x%s %s n=%u tex=%s fmt=%u 0x%x %ux%u src=%d depth=%d/%u wr=%d blend=%d %u/%u "
+                    "atest=%d %u/%u mask=0x%x sc=%d,%d-%d,%d rgba=%08x z=%.1f\n",
+                    index, d.framebuffer_address, plan.target == nullptr ? "(none)" : "",
+                    d.through ? "2d" : "3d", batch.indexed ? batch.index_count : batch.vertex_count,
+                    d.texture_enabled ? "on" : "off", d.texture_format, d.texture_address, d.texture_width,
+                    d.texture_height, static_cast<int>(plan.source), d.depth_test_enabled ? 1 : 0, d.depth_function,
+                    d.depth_write_enabled ? 1 : 0, d.blend_enabled ? 1 : 0, d.blend_source_factor, d.blend_dest_factor,
+                    d.alpha_test_enabled ? 1 : 0, d.alpha_function, d.alpha_reference, d.color_write_mask,
+                    d.scissor_x0, d.scissor_y0, d.scissor_x1, d.scissor_y1, first.rgba, static_cast<double>(first.z));
+    }
+    std::fflush(stdout);
+}
+
+}  // namespace
+
 void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
                                                std::span<const GeGpuVertex> triangle_vertices) noexcept {
     GlState &s = state();
@@ -1940,6 +1991,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             make_uniforms(batch, target->logical_width, target->logical_height, plan.textured);
         std::memcpy(s.uniform_bytes.data() + index * s.uniform_align, &uniforms, sizeof(uniforms));
     }
+    if (publish && ge_gpu_describe_next_frame().exchange(false)) describe_frame(s, draws);
     gl.BindBuffer(GL_UNIFORM_BUFFER, s.uniform_buffer);
     gl.BufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(s.uniform_bytes.size()), s.uniform_bytes.data(),
                   GL_STREAM_DRAW);

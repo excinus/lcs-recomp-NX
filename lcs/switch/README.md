@@ -80,6 +80,18 @@ Small `__SWITCH__` changes in shared code:
   for loading; they are read from their own folder and saved back under this
   release's ID. Saves now get a `PARAM.SFO`. Off on the PC unless
   `LCS_SAVE_PICKER=1`.
+- The save list is drawn as the PSP's save utility (`save_picker_image`, a
+  960x544 picture): the saves' `ICON0.PNG` (decoded with FFmpeg's PNG
+  decoder, `lcs_png.cpp`) in a column with the selected one large, its
+  `PARAM.SFO` title, detail lines and date beside it, charcoal with the red of
+  the game's logo. The OpenGL and SDL presenters show it over the frame; the
+  others keep the text panel.
+- `lcs_ge_exec.cpp`: block transfers (`TRXKICK`, 0xEA) copy their rectangle
+  in guest memory. When the game loads without vblank (`present_if_stalled`)
+  and a transfer wrote into the displayed buffer, that buffer is shown; the
+  log also lists every draw of that frame (`[gl]` lines) and the transfers.
+- `[watch]` lines count audio gaps (queue ran dry) and skips (blocks dropped
+  over the latency limit).
 - `lcs_savedata_crypto.cpp`: reads saves a PSP or PPSSPP encrypted
   (`SAVEDATA_PARAMS` 0x01/0x21/0x41, modes 1/3/5). Whether a `DATA.BIN` is
   encrypted is decided by its bytes (near 8 bits of entropy), not by

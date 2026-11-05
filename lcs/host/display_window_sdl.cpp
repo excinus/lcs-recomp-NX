@@ -7,6 +7,7 @@
 #include "lcs_menu.hpp"
 #include "lcs_mouse.hpp"
 #include "lcs_display_menu.hpp"
+#include "lcs_save_picker.hpp"
 #include "lcs_key_bindings.hpp"
 #include "lcs_render_config.hpp"
 #include "host_font_5x7.hpp"
@@ -397,8 +398,42 @@ void paint_fps(SDL_Renderer *renderer) noexcept {
     draw_text(renderer, margin + 2 * scale, margin + 2 * scale, scale, label);
 }
 
+// The save list's own picture (lcs_save_picker), fitted to the window.
+bool paint_save_list(SDL_Renderer *renderer) noexcept {
+    static std::vector<std::uint8_t> pixels;
+    static std::uint64_t version = 0u;
+    static SDL_Texture *texture = nullptr;
+    static SDL_Renderer *texture_owner = nullptr;
+    const std::uint64_t seen = version;
+    if (!save_picker_image(pixels, version)) return false;
+    if (texture == nullptr || texture_owner != renderer) {
+        texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
+                                    static_cast<int>(kSavePickerImageWidth), static_cast<int>(kSavePickerImageHeight));
+        texture_owner = renderer;
+        if (texture == nullptr) return false;
+        SDL_UpdateTexture(texture, nullptr, pixels.data(), static_cast<int>(kSavePickerImageWidth * 4u));
+    } else if (seen != version) {
+        SDL_UpdateTexture(texture, nullptr, pixels.data(), static_cast<int>(kSavePickerImageWidth * 4u));
+    }
+    int output_w = 960;
+    int output_h = 544;
+    SDL_GetRendererOutputSize(renderer, &output_w, &output_h);
+    const float scale = std::min(static_cast<float>(output_w) / kSavePickerImageWidth,
+                                 static_cast<float>(output_h) / kSavePickerImageHeight);
+    SDL_Rect destination{};
+    destination.w = static_cast<int>(kSavePickerImageWidth * scale);
+    destination.h = static_cast<int>(kSavePickerImageHeight * scale);
+    destination.x = (output_w - destination.w) / 2;
+    destination.y = (output_h - destination.h) / 2;
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderFillRect(renderer, nullptr);
+    SDL_RenderCopy(renderer, texture, nullptr, &destination);
+    return true;
+}
+
 void paint_host_settings(SDL_Renderer *renderer) noexcept {
     if (!host_settings_open() || renderer == nullptr) return;
+    if (paint_save_list(renderer)) return;
     int output_w = 960;
     int output_h = 544;
     SDL_GetRendererOutputSize(renderer, &output_w, &output_h);

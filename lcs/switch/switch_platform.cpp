@@ -21,6 +21,7 @@
 #include <switch.h>
 
 #include "ge_gpu_backend.hpp"
+#include "lcs_audio_output.hpp"
 #include "lcs_display_menu.hpp"
 #include "lcs_switch_hooks.hpp"
 
@@ -401,6 +402,7 @@ void watch_main() {
     const u64 start = armGetSystemTick();
     u64 last_report = start;
     GeGpuBackendReport last_report_gpu{};
+    lcs::AudioOutputStats last_audio{};
     while (!g_watch_stop.load()) {
         svcSleepThread(10'000'000ll);
         const std::size_t count = g_tracked_count.load();
@@ -462,6 +464,12 @@ void watch_main() {
                       double(gpu.decoded_texture_uploads - last_report_gpu.decoded_texture_uploads) / seconds);
         line += tail;
         last_report_gpu = gpu;
+        const lcs::AudioOutputStats audio = lcs::audio_output_stats();
+        std::snprintf(tail, sizeof(tail), " | audio gaps %llu skips %llu",
+                      static_cast<unsigned long long>(audio.underruns - last_audio.underruns),
+                      static_cast<unsigned long long>(audio.dropped_blocks - last_audio.dropped_blocks));
+        line += tail;
+        last_audio = audio;
         std::printf("%s\n", line.c_str());
 
         if (sampling) {

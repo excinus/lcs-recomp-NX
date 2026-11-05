@@ -228,6 +228,12 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
                       start_time_us, now_us, host.device);
 }
 
+AudioOutputStats audio_output_stats() {
+    AudioHost &host = audio_host();
+    std::lock_guard<std::mutex> guard(host.mutex);
+    return AudioOutputStats{host.mixer.underruns(), host.mixer.dropped_blocks()};
+}
+
 void audio_output_advance(std::uint64_t guest_time_us) {
     if (!audio_output_enabled()) return;
     AudioHost &host = audio_host();

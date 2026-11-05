@@ -179,6 +179,9 @@ if(PSPRECOMP_BUILD_TESTS)
     add_executable(lcs_world_detail_test ${CMAKE_SOURCE_DIR}/tests/lcs_world_detail_test.cpp)
     target_link_libraries(lcs_world_detail_test PRIVATE lcs_host)
     add_test(NAME lcs_world_detail_test COMMAND lcs_world_detail_test)
+    add_executable(lcs_ge_transfer_test ${CMAKE_SOURCE_DIR}/tests/lcs_ge_transfer_test.cpp)
+    target_link_libraries(lcs_ge_transfer_test PRIVATE lcs_host)
+    add_test(NAME lcs_ge_transfer_test COMMAND lcs_ge_transfer_test)
     add_executable(lcs_stress_controller_test
         ${CMAKE_SOURCE_DIR}/tests/lcs_stress_controller_test.cpp
         host/lcs_stress_controller.cpp)

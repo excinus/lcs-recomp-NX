@@ -27,6 +27,10 @@ public:
 
     [[nodiscard]] bool opened() const noexcept { return opened_; }
     [[nodiscard]] std::size_t prebuffer_blocks() const noexcept { return prebuffer_blocks_; }
+    // Since the device opened: times the queue ran dry (a gap), blocks thrown
+    // away because the queue was over its limit (a skip).
+    [[nodiscard]] std::uint64_t underruns() const noexcept { return underruns_; }
+    [[nodiscard]] std::uint64_t dropped_blocks() const noexcept { return dropped_blocks_; }
 
     void note_device_opened() {
         ring_.assign(kRingFrames * kOutputChannels, 0);
@@ -187,6 +191,7 @@ private:
         if (!timeline_anchored_ || !opened_) return;
         std::size_t outstanding = device.outstanding_blocks();
         if (playback_started_ && outstanding == 0u) {
+            ++underruns_;
             device.pause_playback();
             playback_started_ = false;
             recovering_from_underrun_ = true;
@@ -199,6 +204,7 @@ private:
         const std::size_t latency_limit_blocks = prebuffer_blocks_ + 2u;
         while (sealed_frame >= output_frame_ + kBlockFrames) {
             if (playback_started_ && outstanding >= latency_limit_blocks) {
+                ++dropped_blocks_;
                 for (std::size_t frame = 0u; frame < kBlockFrames; ++frame) {
                     const std::size_t slot =
                         static_cast<std::size_t>((output_frame_ + frame) % kRingFrames) * kOutputChannels;
@@ -213,6 +219,8 @@ private:
         }
     }
 
+    std::uint64_t underruns_{};
+    std::uint64_t dropped_blocks_{};
     std::vector<std::int32_t> ring_;
     std::uint64_t output_frame_{};
     std::uint64_t guest_anchor_us_{};

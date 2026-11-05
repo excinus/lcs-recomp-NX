@@ -28,9 +28,15 @@ struct SaveSlot {
     bool foreign{false};    // another release's save
     bool encrypted{false};  // DATA.BIN as a PSP stores it (decrypted on load with the game's key)
     std::string title;      // PARAM.SFO SAVEDATA_TITLE
-    std::string detail;     // PARAM.SFO SAVEDATA_DETAIL
+    std::string detail;     // PARAM.SFO SAVEDATA_DETAIL, first line
+    std::vector<std::string> detail_lines;  // all of it
+    std::string game_title; // PARAM.SFO TITLE
     std::string when;       // "2026-11-04 18:02"
     std::int64_t modified{0};
+    // ICON0.PNG as RGBA (the caller decodes it; empty when there is none).
+    std::vector<std::uint8_t> icon;
+    std::uint32_t icon_width{0};
+    std::uint32_t icon_height{0};
 };
 
 enum class SavePickerMode { Load, Save };
@@ -68,7 +74,16 @@ void save_picker_begin(SavePickerMode mode, std::vector<SaveSlot> slots, int foc
 void save_picker_abort() noexcept;
 
 bool save_picker_handle(HostSettingsKey key) noexcept;
+// The list as text rows, for presenters that only draw the text panel.
 [[nodiscard]] HostSettingsView save_picker_view() noexcept;
+
+// The list as the PSP drew it: a full-screen RGBA picture (kSavePickerImage
+// size) with the saves' icons, the selected save's details and the button
+// hints. False when the list is not up. `version` changes whenever the
+// picture does; when it equals the caller's, `rgba` is left alone.
+inline constexpr std::uint32_t kSavePickerImageWidth = 960u;
+inline constexpr std::uint32_t kSavePickerImageHeight = 544u;
+bool save_picker_image(std::vector<std::uint8_t> &rgba, std::uint64_t &version);
 
 // PARAM.SFO of a save: written next to DATA.BIN so the list (and a PSP
 // emulator) can name the save.

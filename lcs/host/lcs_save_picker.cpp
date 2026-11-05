@@ -1,5 +1,6 @@
 #include "lcs_save_picker.hpp"
 
+#include "host_font_5x7.hpp"
 #include "lcs_render_config.hpp"
 #include "lcs_savedata_crypto.hpp"
 
@@ -113,6 +114,15 @@ void fill_details(SaveSlot &slot) {
     if (const auto sfo = parse_save_sfo(read_file(slot.directory / "PARAM.SFO", 64u * 1024u))) {
         slot.title = printable(sfo->savedata_title.empty() ? sfo->title : sfo->savedata_title);
         slot.detail = printable(first_line(sfo->detail));
+        slot.game_title = printable(sfo->title);
+        std::size_t start = 0u;
+        while (start <= sfo->detail.size()) {
+            const std::size_t end = sfo->detail.find('\n', start);
+            const std::string line = printable(sfo->detail.substr(start, end == std::string::npos ? std::string::npos : end - start));
+            if (!line.empty()) slot.detail_lines.push_back(line);
+            if (end == std::string::npos) break;
+            start = end + 1u;
+        }
     }
     // The file decides, not PARAM.SFO: a save decrypted with a PC tool keeps
     // the PSP's PARAM.SFO, which still says encrypted.
@@ -149,6 +159,7 @@ struct PickerState {
 
 std::mutex g_mutex;
 PickerState g_state;
+std::uint64_t g_version = 1u;  // the picture's version; under g_mutex
 
 constexpr int kVisibleRows = 6;
 
@@ -165,12 +176,6 @@ void choose(PickerState &state) {
     }
     const SaveSlot &slot = state.slots[static_cast<std::size_t>(state.selected)];
     if (state.mode == SavePickerMode::Load) {
-        if (slot.foreign) {
-            std::snprintf(state.question, sizeof(state.question), "%s SAVE: MAY NOT WORK. LOAD?",
-                          region_of(slot.game_id));
-            state.stage = Stage::Confirm;
-            return;
-        }
         answer(state, SavePickerOutcome::Chosen);
         return;
     }
@@ -289,6 +294,7 @@ int save_focus_index(const std::vector<SaveSlot> &slots, std::uint32_t focus) no
 
 void save_picker_begin(SavePickerMode mode, std::vector<SaveSlot> slots, int focus) {
     std::lock_guard<std::mutex> guard(g_mutex);
+    ++g_version;
     g_state = PickerState{};
     g_state.mode = mode;
     g_state.slots = std::move(slots);
@@ -315,16 +321,19 @@ SavePickerOutcome save_picker_take(SaveSlot &chosen) {
     const SavePickerOutcome outcome = g_state.outcome;
     chosen = g_state.chosen;
     g_state = PickerState{};
+    ++g_version;
     return outcome;
 }
 
 void save_picker_abort() noexcept {
     std::lock_guard<std::mutex> guard(g_mutex);
     g_state = PickerState{};
+    ++g_version;
 }
 
 bool save_picker_handle(HostSettingsKey key) noexcept {
     std::lock_guard<std::mutex> guard(g_mutex);
+    ++g_version;
     PickerState &state = g_state;
     switch (state.stage) {
     case Stage::Closed:
@@ -409,6 +418,247 @@ HostSettingsView save_picker_view() noexcept {
         }
     }
     return view;
+}
+
+// ---------------------------------------------------------------------------
+// The list as a picture, laid out as the PSP's save utility: a title bar, the
+// saves' icons in a column (the selected one large), its details beside it
+// and the button hints in the corner.
+
+namespace {
+
+struct Canvas {
+    std::uint8_t *pixels;
+    int width;
+    int height;
+
+    void blend(int x, int y, std::uint32_t r, std::uint32_t g, std::uint32_t b, std::uint32_t a) const {
+        if (x < 0 || y < 0 || x >= width || y >= height || a == 0u) return;
+        std::uint8_t *p = pixels + (static_cast<std::size_t>(y) * width + x) * 4u;
+        p[0] = static_cast<std::uint8_t>((r * a + p[0] * (255u - a)) / 255u);
+        p[1] = static_cast<std::uint8_t>((g * a + p[1] * (255u - a)) / 255u);
+        p[2] = static_cast<std::uint8_t>((b * a + p[2] * (255u - a)) / 255u);
+        p[3] = 255u;
+    }
+
+    void rect(int x0, int y0, int x1, int y1, std::uint32_t rgb, std::uint32_t a = 255u) const {
+        for (int y = std::max(0, y0); y < std::min(height, y1); ++y)
+            for (int x = std::max(0, x0); x < std::min(width, x1); ++x)
+                blend(x, y, (rgb >> 16u) & 255u, (rgb >> 8u) & 255u, rgb & 255u, a);
+    }
+
+    void frame(int x0, int y0, int x1, int y1, int thickness, std::uint32_t rgb, std::uint32_t a = 255u) const {
+        rect(x0, y0, x1, y0 + thickness, rgb, a);
+        rect(x0, y1 - thickness, x1, y1, rgb, a);
+        rect(x0, y0 + thickness, x0 + thickness, y1 - thickness, rgb, a);
+        rect(x1 - thickness, y0 + thickness, x1, y1 - thickness, rgb, a);
+    }
+
+    // The 5x7 font; text is upper case. Returns the width drawn.
+    int text(int x, int y, int scale, const std::string &value, std::uint32_t rgb, std::uint32_t a = 255u,
+             int max_width = 1 << 30) const {
+        const int advance = 6 * scale;
+        int drawn = 0;
+        for (unsigned char ch : value) {
+            if (drawn + 5 * scale > max_width) break;
+            const int index = ch < 128u ? kGlyphIndex[ch] : -1;
+            const auto &rows = index >= 0 ? kGlyph5x7[static_cast<std::size_t>(index)] : kGlyph5x7[0];
+            for (int row = 0; row < 7; ++row)
+                for (int bit = 0; bit < 5; ++bit)
+                    if ((rows[static_cast<std::size_t>(row)] & (0x10 >> bit)) != 0)
+                        rect(x + drawn + bit * scale, y + row * scale, x + drawn + (bit + 1) * scale,
+                             y + (row + 1) * scale, rgb, a);
+            drawn += advance;
+        }
+        return drawn;
+    }
+
+    // An image scaled into a box (bilinear), with an opacity.
+    void image(const std::vector<std::uint8_t> &rgba, int source_width, int source_height, int x0, int y0, int w,
+               int h, std::uint32_t a = 255u) const {
+        if (rgba.empty() || source_width <= 0 || source_height <= 0 || w <= 0 || h <= 0) return;
+        for (int y = 0; y < h; ++y) {
+            const float sy = (static_cast<float>(y) + 0.5f) * source_height / h - 0.5f;
+            const int y_low = std::clamp(static_cast<int>(std::floor(sy)), 0, source_height - 1);
+            const int y_high = std::min(y_low + 1, source_height - 1);
+            const float fy = std::clamp(sy - static_cast<float>(y_low), 0.0f, 1.0f);
+            for (int x = 0; x < w; ++x) {
+                const float sx = (static_cast<float>(x) + 0.5f) * source_width / w - 0.5f;
+                const int x_low = std::clamp(static_cast<int>(std::floor(sx)), 0, source_width - 1);
+                const int x_high = std::min(x_low + 1, source_width - 1);
+                const float fx = std::clamp(sx - static_cast<float>(x_low), 0.0f, 1.0f);
+                float channel[4];
+                for (int c = 0; c < 4; ++c) {
+                    const auto at = [&](int px, int py) {
+                        return static_cast<float>(rgba[(static_cast<std::size_t>(py) * source_width + px) * 4u + c]);
+                    };
+                    const float top = at(x_low, y_low) * (1.0f - fx) + at(x_high, y_low) * fx;
+                    const float bottom = at(x_low, y_high) * (1.0f - fx) + at(x_high, y_high) * fx;
+                    channel[c] = top * (1.0f - fy) + bottom * fy;
+                }
+                blend(x0 + x, y0 + y, static_cast<std::uint32_t>(channel[0]), static_cast<std::uint32_t>(channel[1]),
+                      static_cast<std::uint32_t>(channel[2]),
+                      static_cast<std::uint32_t>(channel[3]) * a / 255u);
+            }
+        }
+    }
+
+    // A round button with its letter, as the Switch's own prompts.
+    int button(int x, int y, int radius, const char *letter, std::uint32_t rgb) const {
+        for (int dy = -radius; dy <= radius; ++dy)
+            for (int dx = -radius; dx <= radius; ++dx) {
+                const float distance = std::sqrt(static_cast<float>(dx * dx + dy * dy));
+                const float coverage = std::clamp(static_cast<float>(radius) + 0.5f - distance, 0.0f, 1.0f);
+                if (coverage > 0.0f)
+                    blend(x + radius + dx, y + radius + dy, (rgb >> 16u) & 255u, (rgb >> 8u) & 255u, rgb & 255u,
+                          static_cast<std::uint32_t>(coverage * 255.0f));
+            }
+        const int scale = std::max(1, radius / 6);
+        text(x + radius - (5 * scale) / 2 + 1, y + radius - (7 * scale) / 2, scale, letter, 0x302838u);
+        return 2 * radius;
+    }
+};
+
+std::string upper_copy(std::string value) {
+    for (char &ch : value) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    return value;
+}
+
+void render_picture(const PickerState &state, std::uint8_t *pixels) {
+    const int W = static_cast<int>(kSavePickerImageWidth);
+    const int H = static_cast<int>(kSavePickerImageHeight);
+    const Canvas canvas{pixels, W, H};
+    // Background: charcoal, lighter at the top, as the game's own menus.
+    for (int y = 0; y < H; ++y) {
+        const float t = static_cast<float>(y) / static_cast<float>(H - 1);
+        const auto mix = [&](float top, float bottom) { return static_cast<std::uint8_t>(top + (bottom - top) * t); };
+        const std::uint8_t r = mix(58.0f, 18.0f), g = mix(58.0f, 18.0f), b = mix(62.0f, 20.0f);
+        std::uint8_t *row = pixels + static_cast<std::size_t>(y) * W * 4u;
+        for (int x = 0; x < W; ++x) {
+            row[x * 4 + 0] = r;
+            row[x * 4 + 1] = g;
+            row[x * 4 + 2] = b;
+            row[x * 4 + 3] = 255u;
+        }
+    }
+    // Title bar.
+    const bool loading = state.mode == SavePickerMode::Load;
+    // Title bar, with the red of the game's logo as the accent.
+    constexpr std::uint32_t kAccent = 0xD8262Bu;
+    canvas.rect(0, 0, W, 40, 0x0E0E10u);
+    canvas.rect(0, 40, W, 43, kAccent);
+    canvas.rect(20, 10, 46, 30, kAccent);
+    canvas.rect(25, 15, 41, 25, 0x0E0E10u);
+    canvas.text(62, 9, 3, loading ? "LOAD GAME" : "SAVE GAME", 0xFFFFFFu);
+
+#if defined(__SWITCH__)
+    const bool nintendo = lcs_render_configuration().nx.nintendo_confirm;
+    const char *yes = nintendo ? "A" : "B";
+    const char *no = nintendo ? "B" : "A";
+#else
+    const char *yes = "A";
+    const char *no = "B";
+#endif
+
+    const int count = static_cast<int>(state.slots.size());
+    const auto draw_slot_box = [&](int index, int center_x, int center_y, int w, int h, bool selected) {
+        if (index < 0 || index >= count) return;
+        const SaveSlot &slot = state.slots[static_cast<std::size_t>(index)];
+        const int x0 = center_x - w / 2;
+        const int y0 = center_y - h / 2;
+        if (!slot.icon.empty()) {
+            canvas.image(slot.icon, static_cast<int>(slot.icon_width), static_cast<int>(slot.icon_height), x0, y0, w, h);
+        } else {
+            canvas.rect(x0, y0, x0 + w, y0 + h, 0x505050u);
+            std::string label = slot.exists ? slot_label(slot.slot) : std::string("NEW");
+            if (label.rfind("SLOT ", 0) == 0) label = label.substr(5);
+            const int scale = selected ? 3 : 2;
+            const int text_width = static_cast<int>(label.size()) * 6 * scale;
+            canvas.text(center_x - text_width / 2, center_y - 7 * scale / 2, scale, label, 0xE8E8E8u);
+        }
+        canvas.frame(x0 - (selected ? 4 : 1), y0 - (selected ? 4 : 1), x0 + w + (selected ? 4 : 1),
+                     y0 + h + (selected ? 4 : 1), selected ? 4 : 1, selected ? kAccent : 0x000000u);
+    };
+
+    if (count > 0) {
+        const int column_x = 196;
+        draw_slot_box(state.selected - 1, column_x, 150, 160, 89, false);
+        draw_slot_box(state.selected, column_x, 296, 304, 169, true);
+        draw_slot_box(state.selected + 1, column_x, 448, 160, 89, false);
+
+        // Details of the selected save.
+        const SaveSlot &slot = state.slots[static_cast<std::size_t>(state.selected)];
+        const int text_x = 378;
+        const int text_width = W - text_x - 16;
+        std::string game = slot.game_title.empty() ? std::string("GTA: Liberty City Stories") : slot.game_title;
+        if (slot.foreign) game += std::string(" (") + region_of(slot.game_id) + ")";
+        canvas.text(text_x, 204, 2, upper_copy(game), 0xF0F0F8u, 230u, text_width);
+        canvas.rect(text_x, 226, W, 229, kAccent);
+        canvas.text(text_x, 238, 2, slot.game_id + slot.slot, 0xA8A8ACu, 255u, text_width);
+        if (!slot.exists) {
+            canvas.text(text_x, 266, 3, "NEW SAVE", 0xFFFFFFu, 255u, text_width);
+        } else {
+            canvas.text(text_x, 266, 3, upper_copy(slot.title.empty() ? slot_label(slot.slot) : slot.title), 0xFFFFFFu,
+                        255u, text_width);
+            int y = 300;
+            for (const std::string &line : slot.detail_lines) {
+                if (y > 400) break;
+                canvas.text(text_x, y, 2, upper_copy(line), 0xFFFFFFu, 240u, text_width);
+                y += 20;
+            }
+            if (!slot.when.empty()) canvas.text(text_x, y + 8, 2, slot.when, 0xB8B8BCu, 255u, text_width);
+        }
+    } else {
+        canvas.text(W / 2 - 22 * 6, H / 2 - 10, 2 * 1, "THERE IS NO SAVED DATA", 0xFFFFFFu);
+    }
+
+    // Button hints, bottom right.
+    const auto hints = [&](const char *first_label, const char *second_label) {
+        int x = W - 360;
+        const int y = H - 46;
+        x += canvas.button(x, y, 13, yes, 0xF4F4F4u) + 10;
+        x += canvas.text(x, y + 6, 2, first_label, 0xFFFFFFu, 235u) + 30;
+        x += canvas.button(x, y, 13, no, 0xF4F4F4u) + 10;
+        canvas.text(x, y + 6, 2, second_label, 0xFFFFFFu, 235u);
+    };
+
+    if (state.stage == Stage::Confirm || state.stage == Stage::Message) {
+        canvas.rect(0, 0, W, H, 0x000000u, 110u);
+        const int box_w = 600, box_h = 150;
+        const int x0 = (W - box_w) / 2, y0 = (H - box_h) / 2;
+        canvas.rect(x0, y0, x0 + box_w, y0 + box_h, 0x18181Au, 240u);
+        canvas.frame(x0, y0, x0 + box_w, y0 + box_h, 2, kAccent);
+        const std::string question = state.question;
+        const int width = static_cast<int>(question.size()) * 12;
+        canvas.text(x0 + (box_w - width) / 2, y0 + 40, 2, question, 0xFFFFFFu, 255u, box_w - 20);
+        if (state.stage == Stage::Confirm) {
+            int x = x0 + box_w / 2 - 120;
+            const int y = y0 + 92;
+            x += canvas.button(x, y, 13, yes, 0xF4F4F4u) + 10;
+            x += canvas.text(x, y + 6, 2, "YES", 0xFFFFFFu) + 40;
+            x += canvas.button(x, y, 13, no, 0xF4F4F4u) + 10;
+            canvas.text(x, y + 6, 2, "NO", 0xFFFFFFu);
+        } else {
+            int x = x0 + box_w / 2 - 40;
+            const int y = y0 + 92;
+            x += canvas.button(x, y, 13, yes, 0xF4F4F4u) + 10;
+            canvas.text(x, y + 6, 2, "OK", 0xFFFFFFu);
+        }
+    } else {
+        hints(loading ? "LOAD" : "SAVE", "BACK");
+    }
+}
+
+}  // namespace
+
+bool save_picker_image(std::vector<std::uint8_t> &rgba, std::uint64_t &version) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    if (g_state.stage == Stage::Closed || g_state.stage == Stage::Answered) return false;
+    if (version == g_version && rgba.size() == kSavePickerImageWidth * kSavePickerImageHeight * 4u) return true;
+    rgba.assign(static_cast<std::size_t>(kSavePickerImageWidth) * kSavePickerImageHeight * 4u, 0u);
+    render_picture(g_state, rgba.data());
+    version = g_version;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
