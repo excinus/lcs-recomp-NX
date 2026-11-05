@@ -405,6 +405,7 @@ void watch_main() {
     GeGpuBackendReport last_report_gpu{};
     lcs::AudioOutputStats last_audio{};
     lcs::GeWaitStats last_waits{};
+    std::uint64_t last_guest{};
     while (!g_watch_stop.load()) {
         svcSleepThread(10'000'000ll);
         const std::size_t count = g_tracked_count.load();
@@ -478,6 +479,15 @@ void watch_main() {
                       double(waits.sync_us - last_waits.sync_us) / 1e4 / seconds);
         line += tail;
         last_waits = waits;
+        // Game time per real second: above 100% the game makes sound faster
+        // than the device plays it (the mixer then skips).
+        const std::uint64_t guest = lcs::guest_time_us();
+        if (last_guest != 0u && guest >= last_guest) {
+            std::snprintf(tail, sizeof(tail), " | guest clock %.0f%%",
+                          double(guest - last_guest) / 1e4 / seconds);
+            line += tail;
+        }
+        last_guest = guest;
         std::printf("%s\n", line.c_str());
 
         if (sampling) {

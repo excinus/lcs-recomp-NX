@@ -17,4 +17,6 @@ struct GeWaitStats {
     std::uint64_t sync_us{};
 };
 [[nodiscard]] GeWaitStats ge_wait_stats() noexcept;
+// The game's clock (microseconds) at the last vblank wait.
+[[nodiscard]] std::uint64_t guest_time_us() noexcept;
 }

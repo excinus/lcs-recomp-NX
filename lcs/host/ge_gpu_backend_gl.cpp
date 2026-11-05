@@ -310,9 +310,26 @@ struct GlState {
     GLint present_flip_location{-1};
     GLuint vao{};
     GLuint present_vao{};
+    // The buffers the current frame draws from (one of upload_slots).
     GLuint vertex_buffer{};
     GLuint index_buffer{};
     GLuint uniform_buffer{};
+    // Geometry and uniforms go up into one of three sets of buffers in turn,
+    // each kept at its size: the set was last drawn from two frames ago, so
+    // the driver writes it in place. Re-sizing a buffer every frame (what
+    // glBufferData does) made the Switch's driver allocate and map new
+    // memory for megabytes of vertices each frame.
+    struct UploadSlot {
+        GLuint vertex{};
+        GLuint index{};
+        GLuint uniform{};
+        std::size_t vertex_capacity{};
+        std::size_t index_capacity{};
+        std::size_t uniform_capacity{};
+    };
+    std::array<UploadSlot, 3> upload_slots{};
+    std::size_t upload_slot{};
+    bool upload_ring{true};
     GLuint white{};
     GLuint white_sampler{};
     GLuint present_linear{};
@@ -1378,6 +1395,39 @@ bool present_to_window(GlState &s, GLuint source, std::uint32_t source_width, st
 // ---------------------------------------------------------------------------
 // Creation.
 
+// LCS_GL_UPLOAD_RING=0: one set of buffers, re-sized every frame (the old way).
+bool upload_ring_enabled() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("LCS_GL_UPLOAD_RING");
+        return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Attributes 0-4 read `buffer` (the bound VAO keeps the binding).
+void point_vertex_attributes(GLuint buffer) {
+    gl.BindBuffer(GL_ARRAY_BUFFER, buffer);
+    const auto stride = static_cast<GLsizei>(sizeof(UploadVertex));
+    const auto at = [](std::size_t offset) { return reinterpret_cast<const void *>(offset); };
+    gl.VertexAttribPointer(0u, 4, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, x)));
+    gl.VertexAttribPointer(1u, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, at(offsetof(UploadVertex, rgba)));
+    gl.VertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, u)));
+    gl.VertexAttribPointer(3u, 1, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, q)));
+    gl.VertexAttribPointer(4u, 1, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, fog_factor)));
+}
+
+// `bytes` of `data` into `buffer` (bound to `target`), which grows when it is
+// too small and otherwise keeps its storage.
+void upload_into(GLenum target, GLuint buffer, std::size_t &capacity, const void *data, std::size_t bytes) {
+    constexpr std::size_t kMinimumBytes = 256u * 1024u;
+    gl.BindBuffer(target, buffer);
+    if (bytes > capacity) {
+        capacity = std::max(kMinimumBytes, bytes + bytes / 2u);
+        gl.BufferData(target, static_cast<GLsizeiptr>(capacity), nullptr, GL_DYNAMIC_DRAW);
+    }
+    if (bytes != 0u) gl.BufferSubData(target, 0, static_cast<GLsizeiptr>(bytes), data);
+}
+
 void destroy_backend(GlState &s) noexcept {
     if (s.context != nullptr && s.window != nullptr && SDL_GL_MakeCurrent(s.window, s.context) == 0) {
         for (auto &entry : s.targets) destroy_target(entry.second);
@@ -1390,9 +1440,18 @@ void destroy_backend(GlState &s) noexcept {
         const GLuint samplers[]{s.white_sampler, s.present_linear, s.present_nearest};
         for (GLuint sampler : samplers)
             if (sampler != 0u) gl.DeleteSamplers(1, &sampler);
-        const GLuint buffers[]{s.vertex_buffer, s.index_buffer, s.uniform_buffer, s.draw_id_buffer};
-        for (GLuint buffer : buffers)
-            if (buffer != 0u) gl.DeleteBuffers(1, &buffer);
+        if (s.upload_ring) {
+            for (GlState::UploadSlot &slot : s.upload_slots) {
+                const GLuint slot_buffers[]{slot.vertex, slot.index, slot.uniform};
+                for (GLuint buffer : slot_buffers)
+                    if (buffer != 0u) gl.DeleteBuffers(1, &buffer);
+            }
+        } else {
+            const GLuint own[]{s.vertex_buffer, s.index_buffer, s.uniform_buffer};
+            for (GLuint buffer : own)
+                if (buffer != 0u) gl.DeleteBuffers(1, &buffer);
+        }
+        if (s.draw_id_buffer != 0u) gl.DeleteBuffers(1, &s.draw_id_buffer);
         if (s.vao != 0u) gl.DeleteVertexArrays(1, &s.vao);
         if (s.present_vao != 0u) gl.DeleteVertexArrays(1, &s.present_vao);
         if (s.program != 0u) gl.DeleteProgram(s.program);
@@ -1408,6 +1467,8 @@ void destroy_backend(GlState &s) noexcept {
     s.save_list_version = 0u;
     s.white_sampler = s.present_linear = s.present_nearest = 0u;
     s.vertex_buffer = s.index_buffer = s.uniform_buffer = s.draw_id_buffer = 0u;
+    s.upload_slots = {};
+    s.upload_slot = 0u;
     s.batched = false;
     s.vao = s.present_vao = 0u;
     s.program = s.present_program = 0u;
@@ -1531,25 +1592,26 @@ bool create_backend(GlState &s, std::string &error) {
     gl.Uniform1i(s.present_flip_location, 0);
     gl.UseProgram(0u);
 
-    gl.GenBuffers(1, &s.vertex_buffer);
-    gl.GenBuffers(1, &s.index_buffer);
-    gl.GenBuffers(1, &s.uniform_buffer);
+    s.upload_ring = upload_ring_enabled();
+    if (s.upload_ring) {
+        for (GlState::UploadSlot &slot : s.upload_slots) {
+            gl.GenBuffers(1, &slot.vertex);
+            gl.GenBuffers(1, &slot.index);
+            gl.GenBuffers(1, &slot.uniform);
+        }
+        s.vertex_buffer = s.upload_slots[0].vertex;
+        s.index_buffer = s.upload_slots[0].index;
+        s.uniform_buffer = s.upload_slots[0].uniform;
+    } else {
+        gl.GenBuffers(1, &s.vertex_buffer);
+        gl.GenBuffers(1, &s.index_buffer);
+        gl.GenBuffers(1, &s.uniform_buffer);
+    }
     gl.GenVertexArrays(1, &s.vao);
     gl.BindVertexArray(s.vao);
-    gl.BindBuffer(GL_ARRAY_BUFFER, s.vertex_buffer);
     gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.index_buffer);
-    const auto stride = static_cast<GLsizei>(sizeof(UploadVertex));
-    const auto at = [](std::size_t offset) { return reinterpret_cast<const void *>(offset); };
-    gl.EnableVertexAttribArray(0u);
-    gl.VertexAttribPointer(0u, 4, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, x)));
-    gl.EnableVertexAttribArray(1u);
-    gl.VertexAttribPointer(1u, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, at(offsetof(UploadVertex, rgba)));
-    gl.EnableVertexAttribArray(2u);
-    gl.VertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, u)));
-    gl.EnableVertexAttribArray(3u);
-    gl.VertexAttribPointer(3u, 1, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, q)));
-    gl.EnableVertexAttribArray(4u);
-    gl.VertexAttribPointer(4u, 1, GL_FLOAT, GL_FALSE, stride, at(offsetof(UploadVertex, fog_factor)));
+    for (GLuint attribute = 0u; attribute < 5u; ++attribute) gl.EnableVertexAttribArray(attribute);
+    point_vertex_attributes(s.vertex_buffer);
     if (s.batched) {
         // Draw ids 0..draw_chunk-1, one per instance; a draw's base instance
         // picks its slot in the bound range.
@@ -1826,25 +1888,86 @@ bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte> destination) noe
 namespace {
 
 // The draws of one frame, for the log (see ge_gpu_describe_next_frame).
+void describe_draw(const GlState &s, std::size_t index) {
+    const Batch &batch = s.batches[index];
+    const PlannedDraw &plan = s.plan[index];
+    const GeGpuDrawDescriptor &d = batch.draw;
+    const UploadVertex &first = s.vertices[std::min<std::size_t>(batch.first_vertex, s.vertices.empty() ? 0u : s.vertices.size() - 1u)];
+    const UploadVertex &last = s.vertices[std::min<std::size_t>(
+        batch.first_vertex + (batch.vertex_count == 0u ? 0u : batch.vertex_count - 1u),
+        s.vertices.empty() ? 0u : s.vertices.size() - 1u)];
+    std::printf("[gl]  #%zu fb=0x%x%s %s n=%u tex=%s fmt=%u 0x%x %ux%u src=%d depth=%d/%u wr=%d blend=%d %u/%u "
+                "atest=%d %u/%u mask=0x%x sc=%d,%d-%d,%d rgba=%08x z=%.1f xy=%.0f,%.0f..%.0f,%.0f\n",
+                index, d.framebuffer_address, plan.target == nullptr ? "(none)" : "",
+                d.through ? "2d" : "3d", batch.indexed ? batch.index_count : batch.vertex_count,
+                d.texture_enabled ? "on" : "off", d.texture_format, d.texture_address, d.texture_width,
+                d.texture_height, static_cast<int>(plan.source), d.depth_test_enabled ? 1 : 0, d.depth_function,
+                d.depth_write_enabled ? 1 : 0, d.blend_enabled ? 1 : 0, d.blend_source_factor, d.blend_dest_factor,
+                d.alpha_test_enabled ? 1 : 0, d.alpha_function, d.alpha_reference, d.color_write_mask,
+                d.scissor_x0, d.scissor_y0, d.scissor_x1, d.scissor_y1, first.rgba, static_cast<double>(first.z),
+                static_cast<double>(first.x), static_cast<double>(first.y), static_cast<double>(last.x),
+                static_cast<double>(last.y));
+}
+
+// The stalled-frame report: draws per target, the first and last draws, and
+// every 2D draw with a large texture (a loading card is one).
 void describe_frame(const GlState &s, std::size_t draws) {
     std::printf("[gl] frame of %zu draws, display 0x%x\n", draws, s.display_framebuffer);
-    std::size_t shown = 0u;
-    for (std::size_t index = 0u; index < draws && shown < 40u; ++index, ++shown) {
-        const Batch &batch = s.batches[index];
-        const PlannedDraw &plan = s.plan[index];
-        const GeGpuDrawDescriptor &d = batch.draw;
-        const UploadVertex &first = s.vertices[std::min<std::size_t>(batch.first_vertex, s.vertices.empty() ? 0u : s.vertices.size() - 1u)];
-        std::printf("[gl]  #%zu fb=0x%x%s %s n=%u tex=%s fmt=%u 0x%x %ux%u src=%d depth=%d/%u wr=%d blend=%d %u/%u "
-                    "atest=%d %u/%u mask=0x%x sc=%d,%d-%d,%d rgba=%08x z=%.1f\n",
-                    index, d.framebuffer_address, plan.target == nullptr ? "(none)" : "",
-                    d.through ? "2d" : "3d", batch.indexed ? batch.index_count : batch.vertex_count,
-                    d.texture_enabled ? "on" : "off", d.texture_format, d.texture_address, d.texture_width,
-                    d.texture_height, static_cast<int>(plan.source), d.depth_test_enabled ? 1 : 0, d.depth_function,
-                    d.depth_write_enabled ? 1 : 0, d.blend_enabled ? 1 : 0, d.blend_source_factor, d.blend_dest_factor,
-                    d.alpha_test_enabled ? 1 : 0, d.alpha_function, d.alpha_reference, d.color_write_mask,
-                    d.scissor_x0, d.scissor_y0, d.scissor_x1, d.scissor_y1, first.rgba, static_cast<double>(first.z));
+    std::unordered_map<std::uint32_t, std::size_t> per_target;
+    for (std::size_t index = 0u; index < draws; ++index) ++per_target[s.batches[index].draw.framebuffer_address];
+    for (const auto &[address, count] : per_target)
+        std::printf("[gl]  target 0x%x: %zu draws\n", address, count);
+    std::vector<bool> shown(draws, false);
+    const auto show = [&](std::size_t index) {
+        if (index >= draws || shown[index]) return;
+        shown[index] = true;
+        describe_draw(s, index);
+    };
+    for (std::size_t index = 0u; index < std::min<std::size_t>(draws, 16u); ++index) show(index);
+    std::size_t large = 0u;
+    for (std::size_t index = 0u; index < draws && large < 40u; ++index) {
+        const GeGpuDrawDescriptor &d = s.batches[index].draw;
+        if (d.through && d.texture_enabled && d.texture_width >= 256u && !shown[index]) {
+            show(index);
+            ++large;
+        }
     }
+    for (std::size_t index = draws > 24u ? draws - 24u : 0u; index < draws; ++index) show(index);
     std::fflush(stdout);
+}
+
+// The frame as drawn into `target`, as a 24-bit BMP (the stalled-frame report).
+void dump_target_bmp(GlState &s, const Target &target, const char *path) {
+    const std::uint32_t width = s.target_width;
+    const std::uint32_t height = s.target_height;
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4u);
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+    gl.ReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE,
+                  rgba.data());
+    const std::uint32_t row_bytes = (width * 3u + 3u) & ~3u;
+    std::vector<std::uint8_t> file(54u + static_cast<std::size_t>(row_bytes) * height, 0u);
+    const auto put32 = [&](std::size_t at, std::uint32_t value) {
+        for (int byte = 0; byte < 4; ++byte) file[at + byte] = static_cast<std::uint8_t>(value >> (8 * byte));
+    };
+    file[0] = 'B'; file[1] = 'M';
+    put32(2, static_cast<std::uint32_t>(file.size())); put32(10, 54u); put32(14, 40u);
+    put32(18, width); put32(22, height); file[26] = 1; file[28] = 24;
+    put32(34, row_bytes * height);
+    // Row 0 of the target is the PSP's top line; a BMP starts at the bottom.
+    for (std::uint32_t y = 0; y < height; ++y) {
+        const std::uint8_t *in = rgba.data() + static_cast<std::size_t>(y) * width * 4u;
+        std::uint8_t *out = file.data() + 54u + static_cast<std::size_t>(height - 1u - y) * row_bytes;
+        for (std::uint32_t x = 0; x < width; ++x) {
+            out[x * 3u + 0u] = in[x * 4u + 2u];
+            out[x * 3u + 1u] = in[x * 4u + 1u];
+            out[x * 3u + 2u] = in[x * 4u + 0u];
+        }
+    }
+    if (std::FILE *output = std::fopen(path, "wb")) {
+        std::fwrite(file.data(), 1u, file.size(), output);
+        std::fclose(output);
+        std::printf("[gl]  saved %s (%ux%u)\n", path, width, height);
+    }
 }
 
 }  // namespace
@@ -2040,13 +2163,25 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     evict_stale_textures(s);
     for (auto &entry : s.textures) upload_texture(s, entry.second);
     gl.BindVertexArray(s.vao);
-    gl.BindBuffer(GL_ARRAY_BUFFER, s.vertex_buffer);
-    gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertex_bytes), nullptr, GL_STREAM_DRAW);
-    gl.BufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vertex_bytes), s.vertices.data());
-    if (index_bytes != 0u) {
-        gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.index_buffer);
-        gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(index_bytes), nullptr, GL_STREAM_DRAW);
-        gl.BufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(index_bytes), s.indices.data());
+    GlState::UploadSlot *slot = nullptr;
+    if (s.upload_ring) {
+        s.upload_slot = (s.upload_slot + 1u) % s.upload_slots.size();
+        slot = &s.upload_slots[s.upload_slot];
+        s.vertex_buffer = slot->vertex;
+        s.index_buffer = slot->index;
+        s.uniform_buffer = slot->uniform;
+        upload_into(GL_ARRAY_BUFFER, slot->vertex, slot->vertex_capacity, s.vertices.data(), vertex_bytes);
+        point_vertex_attributes(slot->vertex);
+        upload_into(GL_ELEMENT_ARRAY_BUFFER, slot->index, slot->index_capacity, s.indices.data(), index_bytes);
+    } else {
+        gl.BindBuffer(GL_ARRAY_BUFFER, s.vertex_buffer);
+        gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertex_bytes), nullptr, GL_STREAM_DRAW);
+        gl.BufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vertex_bytes), s.vertices.data());
+        if (index_bytes != 0u) {
+            gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.index_buffer);
+            gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(index_bytes), nullptr, GL_STREAM_DRAW);
+            gl.BufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(index_bytes), s.indices.data());
+        }
     }
 
     // Plan every batch and lay out its uniforms, so they go up at once.
@@ -2095,10 +2230,16 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             make_uniforms(batch, target->logical_width, target->logical_height, plan.textured);
         std::memcpy(s.uniform_bytes.data() + uniform_offset(index), &uniforms, sizeof(uniforms));
     }
-    if (publish && ge_gpu_describe_next_frame().exchange(false)) describe_frame(s, draws);
-    gl.BindBuffer(GL_UNIFORM_BUFFER, s.uniform_buffer);
-    gl.BufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(s.uniform_bytes.size()), s.uniform_bytes.data(),
-                  GL_STREAM_DRAW);
+    const bool describe = publish && ge_gpu_describe_next_frame().exchange(false);
+    if (describe) describe_frame(s, draws);
+    if (slot != nullptr) {
+        upload_into(GL_UNIFORM_BUFFER, slot->uniform, slot->uniform_capacity, s.uniform_bytes.data(),
+                    s.uniform_bytes.size());
+    } else {
+        gl.BindBuffer(GL_UNIFORM_BUFFER, s.uniform_buffer);
+        gl.BufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(s.uniform_bytes.size()), s.uniform_bytes.data(),
+                      GL_STREAM_DRAW);
+    }
     check_gl(s, "frame uploads");
 
     gl.UseProgram(s.program);
@@ -2207,6 +2348,17 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
 
     Target *display = find_target(s, s.display_framebuffer);
     const bool display_ready = touched_display && display != nullptr && display->framebuffer != 0u;
+    if (describe) {
+        static int dumps = 0;
+        if (display_ready && dumps < 12) {
+            char path[32];
+            std::snprintf(path, sizeof(path), "stall%d_gpu.bmp", ++dumps);
+            dump_target_bmp(s, *display, path);
+        } else if (!display_ready) {
+            std::printf("[gl]  this frame did not draw into the displayed target\n");
+        }
+        std::fflush(stdout);
+    }
     bool presented_now = false;
     bool read_back = false;
     if (publish && display_ready) {

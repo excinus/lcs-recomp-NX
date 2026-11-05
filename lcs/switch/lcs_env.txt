@@ -25,9 +25,19 @@
 # Run the GE on the game thread instead of its own thread.
 #LCS_GE_ASYNC=0
 
-# The game goes on while the GE thread draws its previous lists (as on a PSP,
-# where the GE runs beside the CPU). 0 waits for the GE at every list.
-#LCS_GE_OVERLAP=0
+# 1: the game goes on while the GE thread draws its previous lists (as on a
+# PSP, where the GE runs beside the CPU). Off by default; try it and report
+# whether the picture breaks.
+#LCS_GE_OVERLAP=1
+
+# OpenGL: 0 re-sizes the geometry buffers every frame (the old, slower way).
+#LCS_GL_UPLOAD_RING=0
+
+# 0: the game's clock may run ahead of real time again (sound skips).
+#LCS_GUEST_CLOCK_CLAMP=0
+
+# 0: while the game loads, do not draw the lists its vblank interrupt queues.
+#LCS_STALL_VBLANK_LISTS=0
 
 # OpenGL: per-draw values for up to 341 draws in one uniform range (GL 4.2
 # base instance). 0 binds a range per draw.

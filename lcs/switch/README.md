@@ -90,10 +90,31 @@ Small `__SWITCH__` changes in shared code:
   in guest memory. When the game loads without vblank (`present_if_stalled`)
   and a transfer wrote into the displayed buffer, that buffer is shown; the
   log also lists every draw of that frame (`[gl]` lines) and the transfers.
-- `lcs_profile.cpp`: `sceGeListEnQueue` no longer waits for the GE worker to
-  go idle (at most four lists queued); the game waits in `sceGeDrawSync`, as
-  on a PSP. The prescan keeps its own BASE/OFFSET registers. `[watch]` shows
-  how long the game waits at each. `LCS_GE_OVERLAP=0` restores the old way.
+- `lcs_profile.cpp`: with `LCS_GE_OVERLAP=1`, `sceGeListEnQueue` does not
+  wait for the GE worker to go idle (at most four lists queued); the game
+  waits in `sceGeDrawSync`, as on a PSP, and a list's finish callback waits
+  for the worker to have run that list (the game reuses the list's memory
+  once it is called). The prescan keeps its own BASE/OFFSET registers.
+  `[watch]` shows how long the game waits. Off by default: the first console
+  test, before callbacks waited, drew lists the game was rewriting.
+- `ge_gpu_backend_gl.cpp`: geometry and uniforms go into one of three sets
+  of buffers in turn, each kept at its size (`glBufferSubData`); a new
+  `glBufferData` size every frame made the Switch's driver allocate and map
+  megabytes of fresh memory per frame. `LCS_GL_UPLOAD_RING=0` restores it.
+- The mixer dropped about six blocks a second on the console even at a
+  steady 30 fps, which fits a game clock some 7% fast (CPU-time ticks
+  carrying a frame past the vblank it is paced to), making sound faster than
+  the device plays it. Ticks now stop while the guest clock is ahead of real
+  time (Switch default; `LCS_GUEST_CLOCK_CLAMP=0` off) and `[watch]` shows
+  `guest clock N%` (100% is right). The mixer's headroom over the prebuffer is a third of it (4
+  blocks at the Switch's 12) instead of 2.
+- Island loading card: stalled presents now also log who queued the lists
+  (guest thread names, `[thread]` lines at creation), how many came from the
+  vblank interrupt, the draws per render target, every 2D draw with a large
+  texture and the last draws, and save the frame the GPU drew as
+  `stallN_gpu.bmp`. Lists queued from the vblank interrupt, otherwise only
+  scanned, are drawn while the game is stalled (`LCS_STALL_VBLANK_LISTS=0`
+  off).
 - `ge_gpu_backend_gl.cpp`: per-draw uniforms go in arrays of 341 blocks per
   64 KiB range; each draw finds its block through an instanced attribute and
   its base instance (GL 4.2), so the range is bound once per 341 draws, not

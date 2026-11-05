@@ -200,7 +200,13 @@ struct PendingGeCallback {
     std::uint32_t function{};
     std::uint32_t finish_argument{};
     std::uint32_t user_argument{};
+    // The GE worker task that runs the list (0: it already ran). A PSP calls
+    // the finish callback when the GE reaches FINISH; the game then reuses
+    // the list's memory, so the callback must wait for the worker.
+    std::uint64_t worker_task{};
 };
+
+void ge_worker_wait_task_timed(std::uint64_t task);
 
 struct DirectoryHandle {
     std::vector<std::filesystem::directory_entry> entries;
@@ -1612,6 +1618,7 @@ bool deliver_pending_ge_callback(psprecomp::AllegrexContext &ctx, std::uint32_t 
     if (!frames.empty()) return false;
     const PendingGeCallback callback = pending->second.front();
     pending->second.pop_front();
+    if (callback.worker_task != 0u) ge_worker_wait_task_timed(callback.worker_task);
     AsyncReturnFrame frame{};
     frame.resume = ctx;
     frame.callback_uid = callback.callback_uid;
@@ -1809,6 +1816,8 @@ struct GeWorker {
     bool busy{};
     bool stop{};
     bool started{};
+    std::uint64_t submitted{};  // tasks queued so far
+    std::uint64_t completed{};  // tasks finished so far (they run in order)
     std::atomic<std::uint32_t> pending_presents{0u};
 };
 GeWorker ge_worker;
@@ -1839,16 +1848,19 @@ void ge_worker_main() {
         {
             std::lock_guard lock(ge_worker.mutex);
             ge_worker.busy = false;
+            ++ge_worker.completed;
         }
         ge_worker.cv.notify_all();
     }
 }
 
-void ge_worker_submit(std::function<void()> task) {
+// The task's number, for ge_worker_wait_task (0 when it ran here at once).
+std::uint64_t ge_worker_submit(std::function<void()> task) {
     if (!ge_async_enabled()) {
         task();
-        return;
+        return 0u;
     }
+    std::uint64_t number = 0u;
     {
         std::lock_guard lock(ge_worker.mutex);
         if (!ge_worker.started) {
@@ -1857,8 +1869,16 @@ void ge_worker_submit(std::function<void()> task) {
             ge_worker.thread = std::thread(&ge_worker_main);
         }
         ge_worker.tasks.push_back(std::move(task));
+        number = ++ge_worker.submitted;
     }
     ge_worker.cv.notify_all();
+    return number;
+}
+
+void ge_worker_wait_task(std::uint64_t number) {
+    std::unique_lock lock(ge_worker.mutex);
+    if (!ge_worker.started) return;
+    ge_worker.cv.wait(lock, [number] { return ge_worker.completed >= number || ge_worker.stop; });
 }
 
 void ge_worker_wait_idle() {
@@ -1881,6 +1901,10 @@ void timed_ge_wait(std::atomic<std::uint64_t> &counter, Wait &&wait) {
                       std::memory_order_relaxed);
 }
 
+void ge_worker_wait_task_timed(std::uint64_t task) {
+    timed_ge_wait(ge_wait_sync_us, [task] { ge_worker_wait_task(task); });
+}
+
 // Lists queued but not yet run, at most `limit`.
 void ge_worker_wait_queue_below(std::size_t limit) {
     std::unique_lock lock(ge_worker.mutex);
@@ -1889,18 +1913,15 @@ void ge_worker_wait_queue_below(std::size_t limit) {
 }
 
 // The GE runs beside the CPU on a PSP: sceGeListEnQueue returns at once and
-// the game waits in sceGeDrawSync. Waiting for the worker at every enqueue
-// (the PC default) runs the game and the GE in turn. On the Switch the game
-// goes on while the worker draws; LCS_GE_OVERLAP=0 turns it off.
+// the game waits in sceGeDrawSync or for the list's finish callback. With
+// LCS_GE_OVERLAP=1 the game goes on while the worker draws (at most four
+// lists ahead); finish callbacks wait for the worker to run their list.
+// Off by default: the first Switch test, before the callbacks waited, drew
+// the game's lists while it was rewriting them.
 bool ge_overlap_enabled() {
     static const bool enabled = [] {
         const char *text = std::getenv("LCS_GE_OVERLAP");
-        if (text != nullptr && *text != '\0') return std::strcmp(text, "0") != 0;
-#if defined(__SWITCH__)
-        return true;
-#else
-        return false;
-#endif
+        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }
@@ -2069,7 +2090,7 @@ void present_frame(psprecomp::Runtime &rt, const PresentRequest &request) {
                       << (p.clear ? " clear" : "") << "\n";
         }
         static int dumps = 0;
-        if (dumps < 6) {
+        if (dumps < 12) {
             ++dumps;
             const std::string stem = "stall" + std::to_string(dumps);
             dump_guest_framebuffer(rt, request.display_buffer, request.display_stride, request.pixel_format,
@@ -2161,11 +2182,35 @@ PresentRequest make_present_request(const psprecomp::Runtime &rt, bool stalled) 
 std::chrono::steady_clock::time_point last_present_wall{};
 std::uint32_t last_present_framebuffer{};
 std::uint64_t ge_lists_since_present{};
+// For the stalled-frame report: who queued the lists since the last present.
+std::map<std::string, std::uint32_t> list_threads_since_present;
+std::uint32_t vblank_lists_since_present{};
+std::uint32_t vblank_lists_run_since_present{};
+
+// The game has shown nothing for a while (it loads without waiting for vblank).
+bool loading_stall_active() {
+    return last_present_wall.time_since_epoch().count() != 0 &&
+           std::chrono::steady_clock::now() - last_present_wall >= std::chrono::milliseconds(300);
+}
+
+// Lists queued from the vblank interrupt are not drawn while the game runs
+// (the frames come from its own lists); during a load they are, in case the
+// interrupt draws the loading card. LCS_STALL_VBLANK_LISTS=0 turns it off.
+bool run_vblank_lists_when_stalled() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("LCS_STALL_VBLANK_LISTS");
+        return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
 
 void submit_present(psprecomp::Runtime &rt, const PresentRequest &request, bool always = false) {
     last_present_wall = std::chrono::steady_clock::now();
     last_present_framebuffer = request.display_buffer;
     ge_lists_since_present = 0u;
+    list_threads_since_present.clear();
+    vblank_lists_since_present = 0u;
+    vblank_lists_run_since_present = 0u;
     if (!ge_async_enabled()) {
         present_frame(rt, request);
     } else if (always || ge_worker.pending_presents.load() == 0u) {
@@ -2190,10 +2235,16 @@ void present_if_stalled(psprecomp::Runtime &rt) {
     if (now - last_present_wall < std::chrono::milliseconds(300)) return;
     if (ge_lists_since_present == 0u && display_state.frame_buffer == last_present_framebuffer) return;
     static std::uint64_t logged = 0u;
-    if (logged++ < 20u)
+    if (logged++ < 20u) {
         std::cout << "[present] loading without vblank: showing frame 0x" << std::hex
                   << display_state.frame_buffer << std::dec << " (" << ge_lists_since_present
-                  << " lists)\n" << std::flush;
+                  << " lists; from vblank interrupt " << vblank_lists_since_present << ", drawn "
+                  << vblank_lists_run_since_present << "; by thread";
+        for (const auto &[name, count] : list_threads_since_present) std::cout << " \"" << name << "\" " << count;
+        const auto current = thread_table.threads.find(thread_table.current_uid);
+        std::cout << "; now in \"" << (current != thread_table.threads.end() ? current->second.name : "?")
+                  << "\")\n" << std::flush;
+    }
     ge_gpu_describe_next_frame().store(true);
     submit_present(rt, make_present_request(rt, true), true);
     display_window_pump();
@@ -2209,8 +2260,61 @@ void check_wall_clock_limit(psprecomp::Runtime &runtime, std::uint64_t sample_ma
     runtime.stop("Wall-clock limit reached at " + psprecomp::hex32(runtime.cpu().pc));
 }
 
+// The guest's clock against the real one. The game's time moves with vblank
+// waits (paced to real time), thread delays and, while code runs, a tick per
+// few hundred dispatched blocks (an estimate of CPU time). When a frame's
+// ticks pass the next vblank, the wait ends a vblank later in game time than
+// in real time. On the Switch the mixer dropped about six blocks a second at
+// a steady 30 fps, which fits a game clock some 7% fast (its sound outruns
+// the device). With the clamp (Switch default, LCS_GUEST_CLOCK_CLAMP=0 turns
+// it off), ticks stop while the guest clock is ahead of the real one; the
+// [watch] line shows the ratio.
+struct GuestClockAnchor {
+    bool set{};
+    std::chrono::steady_clock::time_point real{};
+    std::uint64_t guest_us{};
+};
+GuestClockAnchor guest_clock_anchor;
+std::atomic<std::uint64_t> guest_time_published{0u};
+
+bool guest_clock_clamp_enabled() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("LCS_GUEST_CLOCK_CLAMP");
+        if (text != nullptr && *text != '\0') return std::strcmp(text, "0") != 0;
+#if defined(__SWITCH__)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return enabled;
+}
+
+// Where the guest clock would be if it ran with real time since the anchor.
+std::uint64_t guest_clock_real_now() {
+    const auto elapsed = std::chrono::steady_clock::now() - guest_clock_anchor.real;
+    return guest_clock_anchor.guest_us +
+           static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+}
+
+// At each vblank wait, `wake` being the guest time the wait ends at. The
+// anchor moves only when the clocks are far apart (a load, a long stall).
+void note_guest_clock_vblank(std::uint64_t wake) {
+    guest_time_published.store(wake, std::memory_order_relaxed);
+    constexpr std::uint64_t kFarApartUs = 6u * kVblankPeriodUs;
+    const auto now = std::chrono::steady_clock::now();
+    if (guest_clock_anchor.set) {
+        const std::uint64_t real = guest_clock_real_now();
+        if (real <= wake + kFarApartUs && wake <= real + kFarApartUs) return;
+    }
+    guest_clock_anchor = GuestClockAnchor{true, now, wake};
+}
+
 void lcs_starvation_tick(psprecomp::Runtime &starvation_runtime, psprecomp::AllegrexContext &ctx) {
-    virtual_time_us += starvation_tick_microseconds;
+    constexpr std::uint64_t kClockSlackUs = 2000u;
+    if (!guest_clock_anchor.set || !guest_clock_clamp_enabled() ||
+        virtual_time_us + starvation_tick_microseconds <= guest_clock_real_now() + kClockSlackUs)
+        virtual_time_us += starvation_tick_microseconds;
     promote_expired_delays();
 
     check_wall_clock_limit(starvation_runtime, 0xFFFu);
@@ -2231,6 +2335,8 @@ void set_wall_clock_limit(double seconds) {
     wall_clock_limit_seconds = seconds;
     wall_clock_start = std::chrono::steady_clock::now();
 }
+
+std::uint64_t guest_time_us() noexcept { return guest_time_published.load(std::memory_order_relaxed); }
 
 GeWaitStats ge_wait_stats() noexcept {
     return GeWaitStats{ge_wait_enqueue_us.load(std::memory_order_relaxed),
@@ -2294,6 +2400,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     ge_next_list_id = 1;
     async_return_frames.clear();
     virtual_time_us = 0u;
+    guest_clock_anchor = GuestClockAnchor{};
     g_vblank_interrupt_due_us = 0u;
     lcs_install_lang(runtime);
 
@@ -2395,6 +2502,10 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 ctx.gpr[8],
             };
             const std::int32_t uid = thread_table.next_uid++;
+            static int created_logged = 0;
+            if (created_logged++ < 48)
+                std::cout << "[thread] " << uid << " \"" << name << "\" priority " << ctx.gpr[6] << " entry 0x"
+                          << std::hex << ctx.gpr[5] << std::dec << "\n";
             record.stack_top = stack_top;
             record.stack_bottom = stack_bottom;
             record.kernel_context = stack_top - 0x100u;
@@ -3633,6 +3744,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         }
         const std::uint32_t vblank_delay = static_cast<std::uint32_t>(
             (virtual_time_us / kVblankPeriodUs + 1u) * kVblankPeriodUs - virtual_time_us);
+        note_guest_clock_vblank(virtual_time_us + vblank_delay);
         if (deliver_pending_ge_callback(ctx, vblank_delay, true)) return;
         if (dispatch_vblank_interrupt(rt, ctx, vblank_delay)) return;
         (void)delay_current_thread(rt, ctx, vblank_delay);
@@ -3647,11 +3759,19 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     runtime.register_hle("sceGe_user", 0xAB49E76Au,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const std::uint32_t list_address = ctx.gpr[4];
-            const bool from_vblank = in_vblank_interrupt();
-            if (!from_vblank) cap_frame_rate(list_address);
+            const bool interrupt_list = in_vblank_interrupt();
+            if (!interrupt_list) cap_frame_rate(list_address);
             ++ge_lists_since_present;
+            if (const auto thread = thread_table.threads.find(thread_table.current_uid);
+                thread != thread_table.threads.end())
+                ++list_threads_since_present[interrupt_list ? thread->second.name + " (vblank)" : thread->second.name];
+            if (interrupt_list) ++vblank_lists_since_present;
+            const bool from_vblank =
+                interrupt_list && !(run_vblank_lists_when_stalled() && loading_stall_active());
+            if (interrupt_list && !from_vblank) ++vblank_lists_run_since_present;
             bool list_finished = false;
             std::uint32_t finish_argument = 0u;
+            std::uint64_t worker_task = 0u;
             if (from_vblank) {
                 const GeListPrescan scan = prescan_ge_list(rt.memory(), list_address);
                 list_finished = scan.finished;
@@ -3664,7 +3784,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 list_finished = scan.finished;
                 finish_argument = scan.finish_argument;
                 const std::uint64_t vblank = display_vblank_index;
-                ge_worker_submit([&rt, list_address, vblank] {
+                worker_task = ge_worker_submit([&rt, list_address, vblank] {
                     execute_ge_list_frame(rt, list_address, vblank);
                 });
             } else if (timed_ge_wait(ge_wait_enqueue_us, [] { ge_worker_wait_idle(); }); ge_async_enabled()) {
@@ -3689,7 +3809,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 list_finished) {
                 pending_ge_callbacks[thread_table.current_uid].push_back(PendingGeCallback{
                     cbid, found->second.finish_function, finish_argument,
-                    found->second.finish_argument});
+                    found->second.finish_argument, worker_task});
             }
             ctx.set_gpr(2, list_id);
         });

@@ -201,7 +201,10 @@ private:
             ? 0u : kMixSafetyFrames;
         const std::uint64_t sealed_frame = guest_frame > safety_frames
             ? guest_frame - safety_frames : 0u;
-        const std::size_t latency_limit_blocks = prebuffer_blocks_ + 2u;
+        // Headroom over the prebuffer for a burst of sound (a slow frame
+        // seals several blocks at once); past it the next block is dropped.
+        const std::size_t latency_limit_blocks =
+            prebuffer_blocks_ + std::max<std::size_t>(2u, prebuffer_blocks_ / 3u);
         while (sealed_frame >= output_frame_ + kBlockFrames) {
             if (playback_started_ && outstanding >= latency_limit_blocks) {
                 ++dropped_blocks_;
