@@ -112,6 +112,17 @@ Small `__SWITCH__` changes in shared code:
   crash report and the system error still follow.
 - The draw-decode worker spins 64 rounds instead of 2000 before sleeping (a
   round is a yield, a system call, and its core is shared).
+- Sound goes out through libnx's `audout` (`AudoutDevice` in
+  `lcs_audio_output.cpp`) instead of SDL. SDL's Switch audio took one block
+  per pass of its thread, so a late pass was a gap the hardware filled with
+  silence, never made up: the mixer's queue overflowed about six times a
+  second even at a steady 30 fps and guest time (crackle), and in one test
+  its thread stopped for good. Our thread waits for audout to hand back one
+  of four buffers, refills it from the queue (silence while prebuffering)
+  and appends it, at a priority above the other core-2 threads; after a
+  second with nothing handed back it restarts audout. The mixer runs at
+  48 kHz on the Switch (audout's only rate; the PSP's 44.1 kHz streams are
+  resampled).
 - The island loading-card experiments are gone (stalled presents, frame
   dumps, list digests): the PC port shows no card either.
 - `lcs_profile.cpp`: with `LCS_GE_OVERLAP=1`, `sceGeListEnQueue` does not

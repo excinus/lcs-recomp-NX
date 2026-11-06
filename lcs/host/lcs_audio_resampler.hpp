@@ -9,10 +9,17 @@ namespace lcs {
 
 class StreamingLinearResampler {
 public:
+#if defined(__SWITCH__)
+    // audout, the Switch's output, plays 48 kHz only.
+    static constexpr std::uint32_t kOutputRate = 48000u;
+#else
     static constexpr std::uint32_t kOutputRate = 44100u;
+#endif
+    // The rate a stream is taken to have when none is given (the PSP's).
+    static constexpr std::uint32_t kDefaultSourceRate = 44100u;
 
-    void reset(std::uint32_t source_rate = kOutputRate, bool stereo = true) noexcept {
-        source_rate_ = source_rate == 0u ? kOutputRate : source_rate;
+    void reset(std::uint32_t source_rate = kDefaultSourceRate, bool stereo = true) noexcept {
+        source_rate_ = source_rate == 0u ? kDefaultSourceRate : source_rate;
         stereo_ = stereo;
         have_previous_ = false;
         previous_left_ = 0;
@@ -29,7 +36,7 @@ public:
     std::uint64_t process(std::span<const std::int16_t> pcm, std::uint32_t frames,
                           bool stereo, std::uint32_t source_rate, Emit &&emit) {
         if (frames == 0u) return 0u;
-        if (source_rate == 0u) source_rate = kOutputRate;
+        if (source_rate == 0u) source_rate = kDefaultSourceRate;
         const std::size_t channels = stereo ? 2u : 1u;
         if (pcm.size() < static_cast<std::size_t>(frames) * channels) return 0u;
 
@@ -83,7 +90,7 @@ public:
     }
 
 private:
-    std::uint32_t source_rate_{kOutputRate};
+    std::uint32_t source_rate_{kDefaultSourceRate};
     bool stereo_{true};
     bool have_previous_{};
     std::int32_t previous_left_{};

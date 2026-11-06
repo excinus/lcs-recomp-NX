@@ -49,7 +49,7 @@ public:
                 std::uint32_t channel, std::uint64_t start_time_us, std::uint64_t now_us,
                 Device &device) {
         if (frames == 0u || channel >= kGuestChannels) return;
-        if (source_rate == 0u) source_rate = kSampleRate;
+        if (source_rate == 0u) source_rate = StreamingLinearResampler::kDefaultSourceRate;
         const std::size_t needed = static_cast<std::size_t>(frames) * (stereo ? 2u : 1u);
         if (pcm.size() < needed) return;
         if (!device.ensure_open(*this)) return;
@@ -141,7 +141,7 @@ private:
         StreamingLinearResampler resampler;
         std::uint64_t cursor{};
         std::uint64_t last_guest_time_us{};
-        std::uint32_t source_rate{kSampleRate};
+        std::uint32_t source_rate{StreamingLinearResampler::kDefaultSourceRate};
         bool stereo{true};
         bool active{};
     };
