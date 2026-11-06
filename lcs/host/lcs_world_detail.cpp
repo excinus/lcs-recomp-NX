@@ -1,4 +1,5 @@
 #include "lcs_world_detail.hpp"
+#include "lcs_file_cache.hpp"
 #include "lcs_render_config.hpp"
 #include "psprecomp/runtime.hpp"
 
@@ -276,8 +277,15 @@ bool expand_world_sector(psprecomp::Runtime &runtime, std::uint32_t world,
         const auto island = memory.load32(world + 12);
         constexpr const char *names[]{"", "INDUST.IMG", "COMMER.IMG", "SUBURB.IMG", "UNDERG.IMG"};
         if (island < 1 || island > 4) return false;
-        std::ifstream image(runtime.game_root() / "PSP_GAME/USRDIR/MODELS" / names[island], std::ios::binary);
-        if (!image) return false;
+        const auto image_path = runtime.game_root() / "PSP_GAME/USRDIR/MODELS" / names[island];
+        // Donors come from memory once the archive is cached (lcs_file_cache):
+        // reading nine sectors from the card each time held the game up.
+        const CachedFile image_bytes = cached_file(image_path);
+        std::ifstream image;
+        if (!image_bytes) {
+            image.open(image_path, std::ios::binary);
+            if (!image) return false;
+        }
         std::vector<WorldSectorSource> sources;
         const auto available = buffer + kWorldBufferSize - address;
         std::size_t total = 48;
@@ -293,9 +301,16 @@ bool expand_world_sector(psprecomp::Runtime &runtime, std::uint32_t world,
             source.x = neighbour[1]; source.y = neighbour[2];
             source.data_size = memory.load32(h + 12);
             source.data.resize(size - 32);
-            image.seekg(memory.load32(h + 24));
-            image.read(reinterpret_cast<char *>(source.data.data()), source.data.size());
-            if (!image) throw std::runtime_error("could not read detailed world neighbour");
+            const std::uint64_t offset = memory.load32(h + 24);
+            if (image_bytes) {
+                if (offset > image_bytes->size() || source.data.size() > image_bytes->size() - offset)
+                    throw std::runtime_error("detailed world neighbour outside the archive");
+                std::memcpy(source.data.data(), image_bytes->data() + offset, source.data.size());
+            } else {
+                image.seekg(static_cast<std::streamoff>(offset));
+                image.read(reinterpret_cast<char *>(source.data.data()), source.data.size());
+                if (!image) throw std::runtime_error("could not read detailed world neighbour");
+            }
             const auto relocation = memory.load32(h + 16), count = memory.load32(h + 20);
             for (unsigned i = 0; i < count; ++i) source.relocations.push_back(u32(source.data, relocation - 32 + i * 4));
             validate_source(source);
@@ -303,7 +318,7 @@ bool expand_world_sector(psprecomp::Runtime &runtime, std::uint32_t world,
             sources.push_back(std::move(source));
           } catch (const std::exception &) {
             if (neighbour[0] == header) throw;
-            image.clear(); // A bad donor must not discard the valid target and neighbours.
+            if (!image_bytes) image.clear(); // A bad donor must not discard the valid target and neighbours.
           }
         }
         auto sector = merge_world_sectors(sources);

@@ -97,6 +97,21 @@ Small `__SWITCH__` changes in shared code:
   that thread, the guest-frame present included. Switch default,
   `LCS_GL_THREAD=0` / `1`. Vertices grow without being initialised first.
 - Threads: the GE worker has core 1 to itself (see "Start-up and threads").
+- `lcs_file_cache.cpp`: the game's `.IMG` archives are read whole into memory
+  by a background thread the first time the game reads one (each up to
+  384 MiB, 1 GiB in all; the log says `[file-cache] NAME in memory`). Reads
+  of a cached archive (`sceIoRead`, the raw disc-sector reads, and the view
+  distance option's neighbouring sectors) are then copies. With View
+  distance 2 every sector change read nine sectors (6-8 MB) from the card on
+  the game thread, and the game thread spent about 7% of a drive in file
+  system requests: the drops to 20 fps. `LCS_FILE_CACHE=0` turns it off.
+- A crash writes `[crash]` lines to `lcs_log.txt`: the exception, the thread,
+  PC / LR and the frame chain as offsets from the image base (place them with
+  the build's `LCSNative.elf` and `aarch64-none-elf-addr2line`), the far
+  address and the registers. The exception is then passed on, so Atmosphere's
+  crash report and the system error still follow.
+- The draw-decode worker spins 64 rounds instead of 2000 before sleeping (a
+  round is a yield, a system call, and its core is shared).
 - The island loading-card experiments are gone (stalled presents, frame
   dumps, list digests): the PC port shows no card either.
 - `lcs_profile.cpp`: with `LCS_GE_OVERLAP=1`, `sceGeListEnQueue` does not

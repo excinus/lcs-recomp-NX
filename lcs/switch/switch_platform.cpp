@@ -37,6 +37,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cstdarg>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -621,6 +623,92 @@ extern "C" void lcs_switch_name_current_thread(const char *name) {
         }
     }
     track_current_thread(name);
+}
+
+// ---------------------------------------------------------------------------
+// Crashes. libnx calls this on the faulting thread (on its own stack) for a
+// CPU exception: a line in lcs_log.txt says where, as offsets from the image
+// base like the profiler's, so a crash can be placed with the build's
+// LCSNative.elf (aarch64-none-elf-addr2line -e LCSNative.elf 0x<offset>).
+// It then reports the exception as unhandled, so Atmosphere still writes its
+// crash report and the system shows its error as before.
+
+extern "C" {
+alignas(16) u8 __nx_exception_stack[0x10000];
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+}
+
+namespace {
+
+// Appends to `text` without allocating (the heap may be what broke).
+struct CrashText {
+    char text[4096];
+    std::size_t used{};
+    void add(const char *format, ...) __attribute__((format(printf, 2, 3))) {
+        if (used >= sizeof(text)) return;
+        va_list args;
+        va_start(args, format);
+        const int wrote = std::vsnprintf(text + used, sizeof(text) - used, format, args);
+        va_end(args);
+        if (wrote > 0) used = std::min(sizeof(text) - 1u, used + static_cast<std::size_t>(wrote));
+    }
+    void address(const char *label, u64 value) {
+        if (value >= g_image_base && value - g_image_base < 0x40000000ull)
+            add(" %s +%llx", label, static_cast<unsigned long long>(value - g_image_base));
+        else
+            add(" %s @%llx", label, static_cast<unsigned long long>(value));
+    }
+};
+
+bool readable(u64 address, u64 bytes) {
+    MemoryInfo info{};
+    u32 page = 0;
+    if (R_FAILED(svcQueryMemory(&info, &page, address))) return false;
+    return (info.perm & Perm_R) != 0 && info.type != MemType_Unmapped &&
+           address + bytes <= info.addr + info.size;
+}
+
+const char *exception_name(u32 description) {
+    switch (description) {
+    case ThreadExceptionDesc_InstructionAbort: return "instruction abort";
+    case ThreadExceptionDesc_MisalignedPC: return "misaligned PC";
+    case ThreadExceptionDesc_MisalignedSP: return "misaligned SP";
+    case ThreadExceptionDesc_SError: return "SError";
+    case ThreadExceptionDesc_BadSVC: return "bad SVC";
+    case ThreadExceptionDesc_Trap: return "trap";
+    case ThreadExceptionDesc_Other: return "data abort or other";
+    default: return "exception";
+    }
+}
+
+}  // namespace
+
+extern "C" void __libnx_exception_handler(ThreadExceptionDump *context) {
+    static CrashText out;
+    out.used = 0u;
+    const Handle self = threadGetCurHandle();
+    const char *thread = "?";
+    for (std::size_t index = 0u; index < g_tracked_count.load(); ++index)
+        if (g_tracked[index].handle == self) thread = g_tracked[index].name;
+    out.add("\n[crash] %s (0x%x) in thread %s:", exception_name(context->error_desc), context->error_desc, thread);
+    out.address("pc", context->pc.x);
+    out.address("lr", context->lr.x);
+    out.add(" far 0x%llx esr 0x%x sp 0x%llx\n[crash] x0-x28:", static_cast<unsigned long long>(context->far.x),
+            context->esr, static_cast<unsigned long long>(context->sp.x));
+    for (int index = 0; index < 29; ++index)
+        out.add(" %llx", static_cast<unsigned long long>(context->cpu_gprs[index].x));
+    out.add("\n[crash] frames:");
+    // The frame-pointer chain: each frame keeps the caller's x29 and x30.
+    u64 frame = context->fp.x;
+    for (int depth = 0; depth < 32 && frame != 0u && (frame & 15u) == 0u && readable(frame, 16u); ++depth) {
+        const u64 *pair = reinterpret_cast<const u64 *>(frame);
+        out.address("", pair[1]);
+        if (pair[0] <= frame) break;
+        frame = pair[0];
+    }
+    out.add("\n");
+    (void)!write(STDOUT_FILENO, out.text, out.used);
+    svcReturnFromException(MAKERESULT(Module_Libnx, LibnxError_ShouldNotHappen));
 }
 
 extern "C" void userAppInit() {

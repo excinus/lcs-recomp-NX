@@ -4078,9 +4078,16 @@ private:
     }
 
     void worker_loop() {
+#if defined(__SWITCH__)
+        // Each relax is a yield (a system call) there, and the worker shares
+        // its core with the GL thread and sound: it spun 64% of its time.
+        constexpr int kSpins = 64;
+#else
+        constexpr int kSpins = 2000;
+#endif
         while (!stop_.load(std::memory_order_relaxed)) {
             if (try_run_one()) continue;
-            for (int spin = 0; spin < 2000; ++spin) {
+            for (int spin = 0; spin < kSpins; ++spin) {
                 if (claimed_.load(std::memory_order_relaxed) <
                     published_.load(std::memory_order_acquire))
                     break;

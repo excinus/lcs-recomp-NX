@@ -1,6 +1,7 @@
 // LCS (GTA: Liberty City Stories) kernel HLE.
 
 #include "lcs_profile.hpp"
+#include "lcs_file_cache.hpp"
 #include "display_window.hpp"
 #include "lcs_ge_exec.hpp"
 #include "ge_renderer.hpp"
@@ -244,6 +245,8 @@ struct FileTable {
     std::unordered_map<std::int32_t, std::fstream> files;
     std::unordered_map<std::int32_t, DirectoryHandle> directories;
     std::unordered_map<std::int32_t, RawSectorFile> raw_sector_files;
+    // Files opened read-only, by fd: their reads may come from lcs_file_cache.
+    std::unordered_map<std::int32_t, std::filesystem::path> read_only_paths;
     std::uint32_t next_virtual_sector{32u};
     std::unordered_map<std::string, VirtualDiscFile> virtual_files_by_path;
     std::map<std::uint32_t, std::string> virtual_path_by_sector;
@@ -354,6 +357,13 @@ std::size_t read_virtual_disc(VirtualDiscHandle &handle, std::span<std::uint8_t>
             const std::uint64_t file_offset = absolute - file_start;
             const std::size_t chunk = static_cast<std::size_t>(
                 std::min<std::uint64_t>(requested - written, file->size - file_offset));
+            if (const std::int64_t copied = read_cached_file(
+                    file->native_path, file_offset, std::span<std::uint8_t>(output.data() + written, chunk));
+                copied >= 0) {
+                written += static_cast<std::size_t>(copied);
+                if (static_cast<std::size_t>(copied) != chunk) break;
+                continue;
+            }
 #if defined(__SWITCH__)
             std::lock_guard<std::mutex> disc_guard(disc_stream_mutex);
             std::ifstream *cached = cached_disc_stream(file->native_path);
@@ -3207,6 +3217,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                             if (stream) {
                                 const auto fd = file_table.next_fd++;
                                 file_table.files.emplace(fd, std::move(stream));
+                                file_table.read_only_paths.emplace(fd, disc_file->native_path);
                                 file_table.raw_sector_files.emplace(
                                     fd, RawSectorFile{0ull, disc_file->size});
                                 ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
@@ -3235,6 +3246,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const auto fd = file_table.next_fd++;
             file_table.files.emplace(fd, std::move(stream));
+            if ((flags & 0x0002u) == 0u) file_table.read_only_paths.emplace(fd, native);
             ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
         });
 
@@ -3242,6 +3254,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             file_table.raw_sector_files.erase(fd);
+            file_table.read_only_paths.erase(fd);
             if (file_table.virtual_disc_handles.erase(fd) == 1u) {
                 ctx.set_gpr(2, 0u);
                 return;
@@ -3298,6 +3311,20 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             it->second.clear();
+            if (const auto read_only = file_table.read_only_paths.find(fd);
+                read_only != file_table.read_only_paths.end()) {
+                const auto position = it->second.tellg();
+                if (position >= 0) {
+                    const std::int64_t copied = read_cached_file(
+                        read_only->second, static_cast<std::uint64_t>(position),
+                        std::span<std::uint8_t>(guest_destination, size));
+                    if (copied >= 0) {
+                        it->second.seekg(position + static_cast<std::streamoff>(copied));
+                        ctx.set_gpr(2, static_cast<std::uint32_t>(copied));
+                        return;
+                    }
+                }
+            }
             it->second.read(reinterpret_cast<char *>(guest_destination), static_cast<std::streamsize>(size));
             const auto read = static_cast<std::uint32_t>(it->second.gcount());
             ctx.set_gpr(2, read);

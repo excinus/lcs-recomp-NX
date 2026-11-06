@@ -37,6 +37,10 @@
 # thread of its own (slower; for comparing or if the picture breaks).
 #LCS_GL_THREAD=0
 
+# 0: read the game's .IMG archives from the card each time instead of
+# keeping them in memory (slower while driving).
+#LCS_FILE_CACHE=0
+
 # 0: the game's clock may run ahead of real time again (sound skips).
 #LCS_GUEST_CLOCK_CLAMP=0
 
