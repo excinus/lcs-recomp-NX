@@ -46,7 +46,7 @@ void writeShort(uint8_t *address, short value);
 void writeInteger(uint8_t *address, int value);
 void writeFloat(uint8_t *address, float value);
 
-char *strtok_r(char *s, const char *delim, char **save_ptr);
+// strtok_r: the host C library's (LCSNative)
 char *_fgets(char *s, int size, SceUID stream);
 
 void makedirs(const char *path);
