@@ -9,6 +9,9 @@
 #include "lcs_stress_test.hpp"
 #include "lcs_render_config.hpp"
 #include "lcs_region.hpp"
+#if defined(LCS_CHEAT_DEVICE)
+#include "cheat_device.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -118,6 +121,28 @@ int main(int argc, char **argv) {
             static_cast<std::uint32_t>((image_end + 0xFFu) & ~0xFFull);
         lcs::display_window_init();
         lcs::install_profile(runtime, user_arena_start);
+
+#if defined(LCS_CHEAT_DEVICE)
+        // Cheat Device Remastered (lcs/cheatdevice): [CheatDevice] Enabled=1
+        // and the player's copy of the release next to the game folder. It
+        // scans the module from its start over the code, as the plugin did.
+        if (lcs::lcs_render_configuration().cheat_device.enabled) {
+            const std::uint32_t module_start = psprecomp::kDefaultPspUserLoadBase;
+            std::uint32_t text_end = 0u;
+            for (const auto &section : elf.sections())
+                if (section.name == ".text")
+                    text_end = elf.section_runtime_address(section, module_start) + section.size;
+            if (text_end > module_start) {
+                const std::uint32_t text_size = text_end - module_start;
+                const auto data_size = static_cast<std::uint32_t>(image_end > text_end ? image_end - text_end : 0u);
+                (void)lcs::cheat_device_start(runtime, game_root.parent_path().empty() ? std::filesystem::path(".")
+                                                                                       : game_root.parent_path(),
+                                              module_start, text_size, data_size);
+            } else {
+                std::cout << "[cheatdevice] not started: no .text section in the EBOOT\n" << std::flush;
+            }
+        }
+#endif
 
         std::string gpu_backend_error;
         if (!lcs::initialize_ge_gpu_backend(gpu_backend_error))

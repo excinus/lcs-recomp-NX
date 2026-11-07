@@ -170,9 +170,16 @@ struct SwitchConfiguration {
     SwitchTriggerMode triggers{SwitchTriggerMode::Dpad};
 };
 
+// [CheatDevice]: Cheat Device Remastered by Freakler, converted (lcs/cheatdevice,
+// GPL-3.0). Off by default; on, it needs the player's copy of the release.
+struct CheatDeviceConfiguration {
+    bool enabled{false};
+};
+
 struct LcsConfiguration {
     ControlsConfiguration controls{};
     SwitchConfiguration nx{};
+    CheatDeviceConfiguration cheat_device{};
     DisplayConfiguration display{};
     RenderingConfiguration rendering{};
     AudioConfiguration audio{};

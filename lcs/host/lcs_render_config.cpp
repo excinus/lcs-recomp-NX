@@ -442,6 +442,17 @@ void apply_switch_key(LcsConfiguration &config, const std::string &key,
     warning(config, line, "unknown [Switch] key '" + key + "'");
 }
 
+void apply_cheat_device_key(LcsConfiguration &config, const std::string &key,
+                            const std::string &value, std::size_t line) {
+    if (key == "enabled" || key == "enable") {
+        bool enabled = false;
+        if (parse_bool(value, enabled)) config.cheat_device.enabled = enabled;
+        else warning(config, line, "CheatDevice.Enabled expects 0 or 1");
+        return;
+    }
+    warning(config, line, "unknown [CheatDevice] key '" + key + "'");
+}
+
 void apply_timing_key(LcsConfiguration &config, const std::string &key,
                       const std::string &value, std::size_t line) {
     if (key == "framerate" || key == "fps" || key == "targetfps") {
@@ -755,6 +766,8 @@ LcsConfiguration load_lcs_render_configuration(const std::filesystem::path &path
             apply_timing_key(config, key, value, line_number);
         else if (section == "switch")
             apply_switch_key(config, key, value, line_number);
+        else if (section == "cheatdevice" || section == "cheat device")
+            apply_cheat_device_key(config, key, value, line_number);
         else if (section == "widescreen")
             apply_widescreen_key(config, key, value, line_number);
         else if (section == "controls")

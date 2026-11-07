@@ -15,6 +15,30 @@ if(WIN32)
 endif()
 target_link_libraries(lcs_host PUBLIC psprecomp_core)
 
+# Cheat Device Remastered by Freakler (github.com/Freakler/CheatDeviceRemastered),
+# converted from the PSP plugin with his permission: GPL-3.0-or-later, see
+# cheatdevice/LICENSE. The plugin was C for GCC (compiled here as C++ with
+# GCC's -fpermissive); other compilers leave it out.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    file(GLOB LCS_CHEATDEVICE_SOURCES CONFIGURE_DEPENDS cheatdevice/*.cpp)
+    add_library(lcs_cheatdevice STATIC ${LCS_CHEATDEVICE_SOURCES})
+    target_include_directories(lcs_cheatdevice PUBLIC cheatdevice PRIVATE cheatdevice/psp)
+    target_link_libraries(lcs_cheatdevice PUBLIC psprecomp_core)
+    target_compile_features(lcs_cheatdevice PUBLIC cxx_std_20)
+    # The C sources compile as C++: C's implicit conversions are allowed and
+    # its warnings (unused variables and the like) are left alone.
+    target_compile_options(lcs_cheatdevice PRIVATE -fpermissive -w -Wno-narrowing)
+    target_compile_definitions(lcs_host PUBLIC LCS_CHEAT_DEVICE=1)
+    target_link_libraries(lcs_host PUBLIC lcs_cheatdevice)
+endif()
+if(PSPRECOMP_BUILD_TESTS AND TARGET lcs_cheatdevice)
+    add_executable(lcs_cheatdevice_test ${CMAKE_SOURCE_DIR}/tests/lcs_cheatdevice_test.cpp)
+    target_link_libraries(lcs_cheatdevice_test PRIVATE lcs_cheatdevice)
+    find_package(Threads REQUIRED)
+    target_link_libraries(lcs_cheatdevice_test PRIVATE Threads::Threads)
+    add_test(NAME lcs_cheatdevice_test COMMAND lcs_cheatdevice_test)
+endif()
+
 if(MSVC)
     target_compile_options(lcs_host PUBLIC /W4 /permissive- /EHsc)
     target_link_options(LCSNative PRIVATE /STACK:67108864)

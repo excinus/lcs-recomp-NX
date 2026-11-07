@@ -107,6 +107,15 @@ public:
     // call a pure guest math helper with an isolated stack/context.
     [[nodiscard]] bool invoke_isolated_aot(std::uint32_t address,
                                            AllegrexContext &ctx);
+    // Runs the guest function at `address` to its return, in `ctx` (the
+    // caller sets the stack pointer and the arguments), then returns: host
+    // integrations call game functions this way from an HLE call or a vblank
+    // wait. PSP thread switches are held off meanwhile, so the function must
+    // not wait for another thread; one that does not return within
+    // `max_dispatches` outer steps is abandoned (false).
+    [[nodiscard]] bool call_guest(std::uint32_t address, AllegrexContext &ctx,
+                                  std::uint64_t max_dispatches = 20'000'000u);
+    [[nodiscard]] bool in_guest_call() const noexcept { return nested_guest_calls_ != 0u; }
     // Profiles may register native replacements for selected guest functions.
     // Generated profile code can call this API without putting game-specific
     // addresses or implementations in the reusable runtime.
@@ -283,6 +292,7 @@ private:
     [[nodiscard]] bool run_starvation_boundary(AllegrexContext &ctx);
 
     GuestMemory memory_;
+    std::uint32_t nested_guest_calls_{0u};
     NidRegistry nids_;
     AllegrexContext cpu_;
     std::unordered_map<std::uint32_t, FunctionEntry> functions_;

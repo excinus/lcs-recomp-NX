@@ -2,6 +2,9 @@
 
 #include "lcs_profile.hpp"
 #include "lcs_file_cache.hpp"
+#if defined(LCS_CHEAT_DEVICE)
+#include "cheat_device.hpp"
+#endif
 #include "display_window.hpp"
 #include "lcs_ge_exec.hpp"
 #include "ge_renderer.hpp"
@@ -3549,7 +3552,12 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const HostInputState host = stress_test_enabled()
                 ? stress_test_input(rt, {}) : display_window_input();
-            const std::uint32_t buttons = host.buttons;
+            std::uint32_t buttons = host.buttons;
+#if defined(LCS_CHEAT_DEVICE)
+            // While its menu has the pad, the cheat device keeps these from
+            // the game (the plugin cleared them in the game's pad routine).
+            buttons &= ~lcs::cheat_device_blocked_buttons();
+#endif
             for (std::uint32_t index = 0u; index < count; ++index) {
                 const std::uint32_t sample = destination + index * sample_size;
                 rt.memory().store32(sample, static_cast<std::uint32_t>(system_time_microseconds()));
@@ -3608,6 +3616,19 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ctx.set_gpr(2, static_cast<std::uint32_t>(display_vblank_index));
         });
     auto wait_vblank = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+#if defined(LCS_CHEAT_DEVICE)
+        // Cheat Device Remastered: its cheats, menu input and picture, once a
+        // frame on the game thread (where the plugin's hooks ran).
+        if (lcs::cheat_device_running()) {
+            const HostInputState pad = display_window_input();
+            lcs::cheat_device_frame(rt, ctx, pad.buttons, pad.analog_x, pad.analog_y, 128u, 128u);
+            if (lcs::cheat_device_exit_requested()) {
+                ge_worker_wait_idle();
+                rt.stop("Exit Game (cheat device)");
+                return;
+            }
+        }
+#endif
         ++display_vblank_index;
         check_wall_clock_limit(rt, 0x3Fu);
         submit_present(rt, make_present_request(rt));

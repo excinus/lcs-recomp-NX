@@ -110,6 +110,12 @@ Small `__SWITCH__` changes in shared code:
   the build's `LCSNative.elf` and `aarch64-none-elf-addr2line`), the far
   address and the registers. The exception is then passed on, so Atmosphere's
   crash report and the system error still follow.
+- Cheat Device Remastered by Freakler is built in (`lcs/cheatdevice`, GPL-3.0,
+  converted with his permission; see its README). `[CheatDevice] Enabled=1`
+  and the release's `cheatdevice_remastered` folder in
+  `sdmc:/switch/LCSNative/` start it; L + UP opens the menu. The runtime got
+  `Runtime::call_guest` for it (a game function run to its return, PSP thread
+  switches held off).
 - The draw-decode worker spins 64 rounds instead of 2000 before sleeping (a
   round is a yield, a system call, and its core is shared).
 - Sound goes out through libnx's `audout` (`AudoutDevice` in

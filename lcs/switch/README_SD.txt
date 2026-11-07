@@ -47,6 +47,17 @@ with their region; they may not work with this one. Saves from a PSP or from
 PPSSPP are encrypted: they are decrypted when loaded, with the key the game
 itself uses (a save of another release may use another key).
 
+Cheat Device
+------------
+Cheat Device Remastered by Freakler is built in
+(https://github.com/Freakler/CheatDeviceRemastered), off by default:
+1. Download its release and copy its "cheatdevice_remastered" folder to
+   sdmc:/switch/LCSNative/cheatdevice_remastered/
+2. In LCSNative.ini set Enabled=1 under [CheatDevice].
+3. In the game, L + UP opens and closes the menu.
+Some of its cheats are not available in this port yet (see
+lcs/cheatdevice/README.md in the source).
+
 Speed
 -----
 The game does not change the clocks. With sys-clk, set them yourself

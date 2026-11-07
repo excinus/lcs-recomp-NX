@@ -188,6 +188,8 @@ bool Runtime::run_starvation_boundary(AllegrexContext &ctx) {
     if (g_starvation_hook == nullptr || interval == 0u) return true;
     // Preserve excess work if a context switch deferred several boundaries.
     dispatches_since_import_ -= std::min(dispatches_since_import_, interval);
+    // A host-initiated call_guest() must come back on the thread it started on.
+    if (nested_guest_calls_ != 0u) return true;
     const RuntimeExecutionContextToken before = capture_runtime_execution_context();
     g_starvation_hook(*this, ctx);
     const bool same_context = runtime_execution_context_matches(before);
@@ -365,6 +367,27 @@ bool Runtime::invoke_isolated_aot(std::uint32_t address, AllegrexContext &ctx) {
     function(*this, ctx);
     ctx.gpr[0] = 0u;
     return true;
+}
+
+bool Runtime::call_guest(std::uint32_t address, AllegrexContext &ctx, std::uint64_t max_dispatches) {
+    // The return address the call comes back to: nothing is ever registered
+    // there (0x0 and 0x4 are the thread and callback returns).
+    constexpr std::uint32_t kReturnAddress = 0x00000008u;
+    ctx.set_gpr(31, kReturnAddress);
+    ctx.pc = address;
+    struct Nesting {
+        std::uint32_t &depth;
+        explicit Nesting(std::uint32_t &value) : depth(value) { ++depth; }
+        ~Nesting() { --depth; }
+    } nesting(nested_guest_calls_);
+    for (std::uint64_t step = 0u; step < max_dispatches; ++step) {
+        if (ctx.pc == kReturnAddress) return true;
+        const RecompiledFunction function = lookup_function(ctx.pc);
+        if (function == nullptr || stopped_) return false;
+        function(*this, ctx);
+        ctx.gpr[0] = 0u;
+    }
+    return false;
 }
 
 std::vector<std::pair<std::string, std::uint64_t>> Runtime::hle_histogram() const {

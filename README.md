@@ -123,6 +123,13 @@ back. L3 + R3 (both sticks pressed) opens the settings panel. "Load game" and
 saving show the PSP's save list, including saves from the game's other
 releases.
 
+**Cheat Device Remastered** by Freakler
+([github.com/Freakler/CheatDeviceRemastered](https://github.com/Freakler/CheatDeviceRemastered))
+is built in, off by default: copy the `cheatdevice_remastered` folder of its
+release next to the `game` folder, set `Enabled=1` under `[CheatDevice]` in
+`LCSNative.ini`, and press L + UP in the game. See
+[`lcs/cheatdevice/README.md`](lcs/cheatdevice/README.md).
+
 The Switch build draws with OpenGL on the console's GPU, and falls back to
 the software renderer. Clocks are left to sys-clk. Details, build steps and
 the porting notes: [`lcs/switch/README.md`](lcs/switch/README.md).
@@ -151,6 +158,11 @@ That way you will get a pre-confugred build environment which also utilzes [ccac
 ## License
 
 MIT, see [`LICENSE`](LICENSE). Third-party notices: [`lcs/THIRD_PARTY.md`](lcs/THIRD_PARTY.md).
+
+`lcs/cheatdevice/` is Cheat Device Remastered by Freakler, converted with his
+permission, under the GPL-3.0-or-later ([`lcs/cheatdevice/LICENSE`](lcs/cheatdevice/LICENSE)).
+Builds that include it (GCC builds: Linux and Switch; others leave it out) are
+distributed under the GPL-3.0 as a whole.
 
 ## Unattended engine stress test
 

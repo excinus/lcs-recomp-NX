@@ -26,6 +26,9 @@
 #include "lcs_render_config.hpp"
 #include "lcs_runtime_log.hpp"
 #include "lcs_save_picker.hpp"
+#if defined(LCS_CHEAT_DEVICE)
+#include "cheat_device.hpp"
+#endif
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -392,6 +395,9 @@ struct GlState {
     GLuint fps_overlay{};
     GLuint settings_overlay{};
     GLuint save_list{};                 // the save list's picture (lcs_save_picker)
+    GLuint cheat_overlay{};             // the cheat device's menu (lcs/cheatdevice)
+    std::vector<std::uint8_t> cheat_overlay_pixels;
+    std::uint64_t cheat_overlay_version{};
     std::vector<std::uint8_t> save_list_pixels;
     std::uint64_t save_list_version{};
     GLuint guest_image{};
@@ -1386,6 +1392,26 @@ bool present_to_window(GlState &s, GLuint source, std::uint32_t source_width, st
                          static_cast<GLsizei>(kSavePickerImageHeight), GL_RGBA, GL_UNSIGNED_BYTE,
                          s.save_list_pixels.data());
     }
+    // The cheat device's menu, over the game picture (under the panels).
+    bool draw_cheat_overlay = false;
+#if defined(LCS_CHEAT_DEVICE)
+    {
+        const std::uint64_t seen = s.cheat_overlay_version;
+        draw_cheat_overlay = cheat_device_overlay(s.cheat_overlay_pixels, s.cheat_overlay_version);
+        if (draw_cheat_overlay && (s.cheat_overlay == 0u || s.cheat_overlay_version != seen) &&
+            s.cheat_overlay_pixels.size() ==
+                static_cast<std::size_t>(kCheatDeviceOverlayWidth) * kCheatDeviceOverlayHeight * 4u) {
+            if (s.cheat_overlay == 0u)
+                s.cheat_overlay = make_texture_2d(kCheatDeviceOverlayWidth, kCheatDeviceOverlayHeight, nullptr);
+            gl.ActiveTexture(GL_TEXTURE0);
+            gl.BindTexture(GL_TEXTURE_2D, s.cheat_overlay);
+            gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(kCheatDeviceOverlayWidth),
+                             static_cast<GLsizei>(kCheatDeviceOverlayHeight), GL_RGBA, GL_UNSIGNED_BYTE,
+                             s.cheat_overlay_pixels.data());
+        }
+        draw_cheat_overlay = draw_cheat_overlay && s.cheat_overlay != 0u;
+    }
+#endif
     if (decision.composite_settings && !draw_save_list) {
         s.overlay_pixels.assign(static_cast<std::size_t>(kSettingsOverlayWidth) * kSettingsOverlayHeight * 4u, 0u);
         rasterize_settings_overlay(decision.settings, s.overlay_pixels.data(), kSettingsOverlayWidth,
@@ -1413,6 +1439,9 @@ bool present_to_window(GlState &s, GLuint source, std::uint32_t source_width, st
     const bool nearest = display.upscale_filter == DisplayUpscaleFilter::Nearest;
     draw_present_layer(s, source, nearest ? s.present_nearest : s.present_linear, fitted.x, fitted.y,
                        fitted.width, fitted.height, screen_width, screen_height, true);
+    if (draw_cheat_overlay)
+        draw_present_layer(s, s.cheat_overlay, s.present_linear, fitted.x, fitted.y, fitted.width, fitted.height,
+                           screen_width, screen_height, false);
     if (draw_fps) {
         const std::int32_t panel_h = std::max(28, static_cast<std::int32_t>(screen_height / 28u));
         const std::int32_t panel_w = panel_h * static_cast<std::int32_t>(kFpsOverlayWidth / kFpsOverlayHeight);
@@ -1488,7 +1517,8 @@ void destroy_backend(GlState &s) noexcept {
         for (auto &entry : s.textures)
             if (entry.second.texture != 0u) gl.DeleteTextures(1, &entry.second.texture);
         for (auto &entry : s.samplers) gl.DeleteSamplers(1, &entry.second);
-        const GLuint textures[]{s.white, s.fps_overlay, s.settings_overlay, s.guest_image, s.save_list};
+        const GLuint textures[]{s.white, s.fps_overlay, s.settings_overlay, s.guest_image, s.save_list,
+                                s.cheat_overlay};
         for (GLuint texture : textures)
             if (texture != 0u) gl.DeleteTextures(1, &texture);
         const GLuint samplers[]{s.white_sampler, s.present_linear, s.present_nearest};
@@ -1517,7 +1547,8 @@ void destroy_backend(GlState &s) noexcept {
     s.targets.clear();
     s.textures.clear();
     s.samplers.clear();
-    s.white = s.fps_overlay = s.settings_overlay = s.guest_image = s.save_list = 0u;
+    s.white = s.fps_overlay = s.settings_overlay = s.guest_image = s.save_list = s.cheat_overlay = 0u;
+    s.cheat_overlay_version = 0u;
     s.save_list_version = 0u;
     s.white_sampler = s.present_linear = s.present_nearest = 0u;
     s.vertex_buffer = s.index_buffer = s.uniform_buffer = s.draw_id_buffer = 0u;
